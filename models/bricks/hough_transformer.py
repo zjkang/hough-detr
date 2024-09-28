@@ -15,50 +15,50 @@ from models.bricks.position_encoding import PositionEmbeddingLearned, get_sine_p
 from util.misc import inverse_sigmoid
 
 
-class MaskPredictor(nn.Module):
-    def __init__(self, in_dim, h_dim):
-        super().__init__()
-        self.h_dim = h_dim
-        self.layer1 = nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, h_dim),
-            nn.GELU(),
-        )
-        self.layer2 = nn.Sequential(
-            nn.Linear(h_dim, h_dim // 2),
-            nn.GELU(),
-            nn.Linear(h_dim // 2, h_dim // 4),
-            nn.GELU(),
-            nn.Linear(h_dim // 4, 1),
-        )
+# class MaskPredictor(nn.Module):
+#     def __init__(self, in_dim, h_dim):
+#         super().__init__()
+#         self.h_dim = h_dim
+#         self.layer1 = nn.Sequential(
+#             nn.LayerNorm(in_dim),
+#             nn.Linear(in_dim, h_dim),
+#             nn.GELU(),
+#         )
+#         self.layer2 = nn.Sequential(
+#             nn.Linear(h_dim, h_dim // 2),
+#             nn.GELU(),
+#             nn.Linear(h_dim // 2, h_dim // 4),
+#             nn.GELU(),
+#             nn.Linear(h_dim // 4, 1),
+#         )
 
-        self.apply(self.init_weights)
+#         self.apply(self.init_weights)
 
-    @staticmethod
-    def init_weights(m):
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
-            nn.init.constant_(m.bias, 0)
+#     @staticmethod
+#     def init_weights(m):
+#         if isinstance(m, nn.Linear):
+#             nn.init.xavier_uniform_(m.weight)
+#             nn.init.constant_(m.bias, 0)
 
-    def forward(self, x):
-        z = self.layer1(x)
-        z_local, z_global = torch.split(z, self.h_dim // 2, dim=-1)
-        z_global = z_global.mean(dim=1, keepdim=True).expand(-1, z_local.shape[1], -1)
-        z = torch.cat([z_local, z_global], dim=-1)
-        out = self.layer2(z)
-        return out
+#     def forward(self, x):
+#         z = self.layer1(x)
+#         z_local, z_global = torch.split(z, self.h_dim // 2, dim=-1)
+#         z_global = z_global.mean(dim=1, keepdim=True).expand(-1, z_local.shape[1], -1)
+#         z = torch.cat([z_local, z_global], dim=-1)
+#         out = self.layer2(z)
+#         return out
 
 
 BN_MOMENTUM = 0.1
 
 class HeatmapPredictor(nn.Module):
     def __init__(
-            self,
-            num_classes,
-            embed_dim,
-            region_num,
-            vote_field_size=17,
-            head_conv=64):
+        self,
+        num_classes,
+        embed_dim,
+        region_num,
+        vote_field_size=17,
+        head_conv=64):
         super().__init__()
         self.inplanes = embed_dim # default=64
         self.region_num = region_num
@@ -210,9 +210,7 @@ class HoughTransformer(TwostageTransformer):
         self.encoder_class_head = nn.Linear(self.embed_dim, num_classes)
         self.encoder_bbox_head = MLP(self.embed_dim, self.embed_dim, 4, 3)
         self.encoder.enhance_mcsp = self.encoder_class_head
-        self.enc_mask_predictor = MaskPredictor(self.embed_dim, self.embed_dim)
-        self.enc_mask_voting_hm_predictor = HeatmapPredictor(
-            self.num_classes, self.embed_dim, self.vote_field_size)
+        self.enc_mask_voting_hm_predictor = HeatmapPredictor(self.num_classes, self.embed_dim, self.vote_field_size)
 
         self.init_weights()
 
@@ -239,90 +237,83 @@ class HoughTransformer(TwostageTransformer):
         attn_mask,
     ):
         # get input for encoder
+        # feat_flatten: (b, sum(h_i x w_i), c=embed_dim)
         feat_flatten = self.flatten_multi_level(multi_level_feats)
+        # mask_flatten: (b, sum(h_i x w_i))
         mask_flatten = self.flatten_multi_level(multi_level_masks)
+        # lvl_pos_embed_flatten: (b, sum(h_i x w_i), c)
         lvl_pos_embed_flatten = self.get_lvl_pos_embed(multi_level_pos_embeds)
+        # spatial_shapes: (L, 2), level_start_index: (L+1), valid_ratios: (b, L, 2)
         spatial_shapes, level_start_index, valid_ratios = self.multi_level_misc(multi_level_masks)
-
+        # backbone_output_memory: (b, sum(h_i x w_i), c)
         backbone_output_memory = self.gen_encoder_output_proposals(
             feat_flatten + lvl_pos_embed_flatten, mask_flatten, spatial_shapes
         )[0]
 
         # calculate filtered tokens numbers for each feature map
+        # reverse_multi_level_masks: [(b, h_i, w_i)]
         reverse_multi_level_masks = [~m for m in multi_level_masks]
+        # valid_token_nums: (b, L), L is the number of feature levels
         valid_token_nums = torch.stack([m.sum((1, 2)) for m in reverse_multi_level_masks], -1)
+        # focus_token_nums: (b, L)
         focus_token_nums = (valid_token_nums * self.level_filter_ratio).int()
+        # level_token_nums: (L,)
         level_token_nums = focus_token_nums.max(0)[0]
+        # focus_token_nums: (b,)
         focus_token_nums = focus_token_nums.sum(-1)
 
-        # from high level to low level
+        # Generate heatmaps for each level
         batch_size = feat_flatten.shape[0]
+        heatmaps = []
         selected_score = []
         selected_inds = []
         salience_score = []
         for level_idx in range(spatial_shapes.shape[0] - 1, -1, -1):
             start_index = level_start_index[level_idx]
             end_index = level_start_index[level_idx + 1] if level_idx < spatial_shapes.shape[0] - 1 else None
+            # level_memory: (b, h_i x w_i, channels)
             level_memory = backbone_output_memory[:, start_index:end_index, :]
+            # mask: (b, h_i x w_i)
             mask = mask_flatten[:, start_index:end_index]
-            # update the memory using the higher-level score_prediction
+            # Reshape level_memory to match spatial dimensions, (b, channels, h_i, w_i)
+            level_memory = level_memory.permute(0, 2, 1).view(batch_size, -1, *spatial_shapes[level_idx])
+
             if level_idx != spatial_shapes.shape[0] - 1:
-                upsample_score = torch.nn.functional.interpolate(
-                    score,
-                    size=spatial_shapes[level_idx].unbind(),
-                    mode="bilinear",
-                    align_corners=True,
-                )
-                upsample_score = upsample_score.view(batch_size, -1, spatial_shapes[level_idx].prod())
-                upsample_score = upsample_score.transpose(1, 2)
-                level_memory = level_memory + level_memory * upsample_score * self.alpha[level_idx]
-            # predict the foreground score of the current layer
-            score = self.enc_mask_predictor(level_memory)
-            valid_score = score.squeeze(-1).masked_fill(mask, score.min())
-            score = score.transpose(1, 2).view(batch_size, -1, *spatial_shapes[level_idx])
-
-            # get the topk salience index of the current feature map level
-            level_score, level_inds = valid_score.topk(level_token_nums[level_idx], dim=1)
-            level_inds = level_inds + level_start_index[level_idx]
-            salience_score.append(score)
-            selected_inds.append(level_inds)
-            selected_score.append(level_score)
-
-        selected_score = torch.cat(selected_score[::-1], 1)
-        index = torch.sort(selected_score, dim=1, descending=True)[1]
-        selected_inds = torch.cat(selected_inds[::-1], 1).gather(1, index)
-
-        ## my code
-        # Generate heatmaps for each level
-        heatmaps = []
-        for level_idx in range(spatial_shapes.shape[0] - 1, -1, -1):
-            start_index = level_start_index[level_idx]
-            end_index = level_start_index[level_idx + 1] if level_idx < spatial_shapes.shape[0] - 1 else None
-            level_memory = backbone_output_memory[:, start_index:end_index, :]
-
-            # Reshape level_memory to match spatial dimensions
-            # level_memory: (b, h, w, channels)
-            level_memory = level_memory.view(batch_size, *spatial_shapes[level_idx], -1)
-
-            # Upsample to the first level's resolution
-            if level_idx > 0:
-                level_memory = torch.nn.functional.interpolate(
-                    level_memory,
+                # Upsample to the first level's resolution
+                heat_map = torch.nn.functional.interpolate(
+                    heat_map,
                     size=spatial_shapes[0].unbind(),
                     mode="bilinear",
                     align_corners=True
                 )
 
             # Generate hm voting
+            # heat_map:(b, num_classes, h_i, w_i)
             heat_map = self.enc_mask_voting_hm_predictor(level_memory)
+            # heat_map:(b, num_classes, h_i, w_i) -> (b, h_i*w_i, num_classes)
+            heat_map = heat_map.permute(0, 2, 3, 1).reshape(batch_size, -1, self.num_classes)
             heatmaps.append(heat_map)
 
+            # score:(b, h_i*w_i)
+            score = heat_map.sum(dim=-1)
+            # valid_score:(b, h_i*w_i)
+            valid_score = score.masked_fill(mask, score.min())
+
+            # level_score:(b, k), level_inds:(b, k)
+            level_score, level_inds = valid_score.topk(
+                level_token_nums[level_idx], dim=1)
+            # level_inds:(b, k) -> to flatten index
+            level_inds = level_inds + level_start_index[level_idx]
+
+            salience_score.append(score)
+            selected_inds.append(level_inds)
+            selected_score.append(level_score)
+
+
         # Combine heatmaps from all levels
-        # combined_voting_hm: (b, num_classes, h, w)
-        combined_voting_hm = torch.stack(heatmaps).sum(dim=0)
-        # Do I need normalization?
-        combined_voting_hm = combined_voting_hm / combined_voting_hm.max()
-        ## my code
+        # combined_voting_hm: (b, sum(h_i x w_i), num_classes)
+        combined_voting_hm = torch.cat(heatmaps[::-1], dim=1)
+        # combined_voting_hm = combined_voting_hm / combined_voting_hm.max()
 
         # create layer-wise filtering
         num_inds = selected_inds.shape[1]
@@ -347,6 +338,7 @@ class HoughTransformer(TwostageTransformer):
             focus_token_nums=focus_token_nums,
             foreground_inds=selected_inds,
             multi_level_masks=multi_level_masks,
+            heat_maps = heat_maps
         )
 
         if self.neck is not None:

@@ -137,6 +137,7 @@ class SalienceCriterion(nn.Module):
         mask = (1 - self.noise_scale) * mask + self.noise_scale * torch.rand_like(mask)
         return mask # confidence score & 0
 
+
 # loss function optimization
 class HoughCriterion(nn.Module):
     def __init__(
@@ -153,6 +154,8 @@ class HoughCriterion(nn.Module):
         self.gamma = gamma
 
     def forward(self, foreground_mask, targets, feature_strides, image_sizes):
+        # foreground_mask: [(batch_size, 1, H_i, W_i)]
+        # gt_boxes_list: [boxes] len() = batch, boxes: the boxes in one image
         gt_boxes_list = []
         for t, (img_h, img_w) in zip(targets, image_sizes):
             boxes = t["boxes"]
