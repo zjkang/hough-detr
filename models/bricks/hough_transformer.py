@@ -15,38 +15,38 @@ from models.bricks.position_encoding import PositionEmbeddingLearned, get_sine_p
 from util.misc import inverse_sigmoid
 
 
-# class MaskPredictor(nn.Module):
-#     def __init__(self, in_dim, h_dim):
-#         super().__init__()
-#         self.h_dim = h_dim
-#         self.layer1 = nn.Sequential(
-#             nn.LayerNorm(in_dim),
-#             nn.Linear(in_dim, h_dim),
-#             nn.GELU(),
-#         )
-#         self.layer2 = nn.Sequential(
-#             nn.Linear(h_dim, h_dim // 2),
-#             nn.GELU(),
-#             nn.Linear(h_dim // 2, h_dim // 4),
-#             nn.GELU(),
-#             nn.Linear(h_dim // 4, 1),
-#         )
+class MaskPredictor(nn.Module):
+    def __init__(self, in_dim, h_dim):
+        super().__init__()
+        self.h_dim = h_dim
+        self.layer1 = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, h_dim),
+            nn.GELU(),
+        )
+        self.layer2 = nn.Sequential(
+            nn.Linear(h_dim, h_dim // 2),
+            nn.GELU(),
+            nn.Linear(h_dim // 2, h_dim // 4),
+            nn.GELU(),
+            nn.Linear(h_dim // 4, 1),
+        )
 
-#         self.apply(self.init_weights)
+        self.apply(self.init_weights)
 
-#     @staticmethod
-#     def init_weights(m):
-#         if isinstance(m, nn.Linear):
-#             nn.init.xavier_uniform_(m.weight)
-#             nn.init.constant_(m.bias, 0)
+    @staticmethod
+    def init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            nn.init.constant_(m.bias, 0)
 
-#     def forward(self, x):
-#         z = self.layer1(x)
-#         z_local, z_global = torch.split(z, self.h_dim // 2, dim=-1)
-#         z_global = z_global.mean(dim=1, keepdim=True).expand(-1, z_local.shape[1], -1)
-#         z = torch.cat([z_local, z_global], dim=-1)
-#         out = self.layer2(z)
-#         return out
+    def forward(self, x):
+        z = self.layer1(x)
+        z_local, z_global = torch.split(z, self.h_dim // 2, dim=-1)
+        z_global = z_global.mean(dim=1, keepdim=True).expand(-1, z_local.shape[1], -1)
+        z = torch.cat([z_local, z_global], dim=-1)
+        out = self.layer2(z)
+        return out
 
 
 BN_MOMENTUM = 0.1
@@ -237,15 +237,15 @@ class HoughTransformer(TwostageTransformer):
         attn_mask,
     ):
         # get input for encoder
-        # feat_flatten: (b, sum(h_i x w_i), c=embed_dim)
+        # feat_flatten: (b, sum(h_i * w_i), c=embed_dim)
         feat_flatten = self.flatten_multi_level(multi_level_feats)
-        # mask_flatten: (b, sum(h_i x w_i))
+        # mask_flatten: (b, sum(h_i * w_i))
         mask_flatten = self.flatten_multi_level(multi_level_masks)
-        # lvl_pos_embed_flatten: (b, sum(h_i x w_i), c)
+        # lvl_pos_embed_flatten: (b, sum(h_i * w_i), c)
         lvl_pos_embed_flatten = self.get_lvl_pos_embed(multi_level_pos_embeds)
         # spatial_shapes: (L, 2), level_start_index: (L+1), valid_ratios: (b, L, 2)
         spatial_shapes, level_start_index, valid_ratios = self.multi_level_misc(multi_level_masks)
-        # backbone_output_memory: (b, sum(h_i x w_i), c)
+        # backbone_output_memory: (b, sum(h_i * w_i), c)
         backbone_output_memory = self.gen_encoder_output_proposals(
             feat_flatten + lvl_pos_embed_flatten, mask_flatten, spatial_shapes
         )[0]
@@ -264,16 +264,16 @@ class HoughTransformer(TwostageTransformer):
 
         # Generate heatmaps for each level
         batch_size = feat_flatten.shape[0]
-        heatmaps = []
+        heat_maps = []
         selected_score = []
         selected_inds = []
         salience_score = []
         for level_idx in range(spatial_shapes.shape[0] - 1, -1, -1):
             start_index = level_start_index[level_idx]
             end_index = level_start_index[level_idx + 1] if level_idx < spatial_shapes.shape[0] - 1 else None
-            # level_memory: (b, h_i x w_i, channels)
+            # level_memory: (b, h_i * w_i, channels)
             level_memory = backbone_output_memory[:, start_index:end_index, :]
-            # mask: (b, h_i x w_i)
+            # mask: (b, h_i * w_i)
             mask = mask_flatten[:, start_index:end_index]
             # Reshape level_memory to match spatial dimensions, (b, channels, h_i, w_i)
             level_memory = level_memory.permute(0, 2, 1).view(batch_size, -1, *spatial_shapes[level_idx])
@@ -292,7 +292,7 @@ class HoughTransformer(TwostageTransformer):
             heat_map = self.enc_mask_voting_hm_predictor(level_memory)
             # heat_map:(b, num_classes, h_i, w_i) -> (b, h_i*w_i, num_classes)
             heat_map = heat_map.permute(0, 2, 3, 1).reshape(batch_size, -1, self.num_classes)
-            heatmaps.append(heat_map)
+            heat_maps.append(heat_map)
 
             # score:(b, h_i*w_i)
             score = heat_map.sum(dim=-1)
@@ -309,6 +309,12 @@ class HoughTransformer(TwostageTransformer):
             selected_inds.append(level_inds)
             selected_score.append(level_score)
 
+        # 从低层级到高层级排列, 沿着维度 1（列方向）将所有层级的得分连接起来
+        # selected_score: (b, sum(k_i))
+        selected_score = torch.cat(selected_score[::-1], 1)
+        index = torch.sort(selected_score, dim=1, descending=True)[1]
+        # selected_inds: (b, sum(k_i)) 按显著性得分从高到低排序的 token 索引
+        selected_inds = torch.cat(selected_inds[::-1], 1).gather(1, index)
 
         # Combine heatmaps from all levels
         # combined_voting_hm: (b, sum(h_i x w_i), num_classes)
@@ -320,9 +326,15 @@ class HoughTransformer(TwostageTransformer):
         # change dtype to avoid shape inference error during exporting ONNX
         cast_dtype = num_inds.dtype if torchvision._is_tracing() else torch.int64
         layer_filter_ratio = (num_inds * self.layer_filter_ratio).to(cast_dtype)
+        # transformer encode: 对每一层，根据计算出的保留数量 r，从 selected_inds 中选择前 r 个索引
+        # selected_inds: [[d1,d2,d_r]]: selected foreground index each layer
         selected_inds = [selected_inds[:, :r] for r in layer_filter_ratio]
+        # 反转 salience_score 列表，使其从低层级到高层级排列
+        # salience_score: [(b, h_i*w_i)]
         salience_score = salience_score[::-1]
-        foreground_score = self.flatten_multi_level(salience_score).squeeze(-1)
+        # foreground_score: (b,sum(h_i*w_i))
+        foreground_score = self.flatten_multi_level(salience_score)#.squeeze(-1)
+        # foreground_score: (b,sum(h_i*w_i))
         foreground_score = foreground_score.masked_fill(mask_flatten, foreground_score.min())
 
         # transformer encoder
@@ -393,7 +405,7 @@ class HoughTransformer(TwostageTransformer):
 
         return outputs_classes, outputs_coords,\
             enc_outputs_class, enc_outputs_coord,\
-            salience_score, norm_voting_hm
+            salience_score, heat_maps
 
     @staticmethod
     def fast_repeat_interleave(input, repeats):
@@ -577,19 +589,27 @@ class HoughTransformerEncoder(nn.Module):
 
     @staticmethod
     def get_reference_points(spatial_shapes, valid_ratios, device):
+        # valid_ratios: (b, num_levels, 2)
         reference_points_list = []
         for lvl, (h, w) in enumerate(spatial_shapes):
+            # 创建一个覆盖整个特征图的均匀网格
             ref_y, ref_x = torch.meshgrid(
                 torch.linspace(0.5, h - 0.5, h, dtype=torch.float32, device=device),
                 torch.linspace(0.5, w - 0.5, w, dtype=torch.float32, device=device),
                 indexing="ij",
             )
+            # 将坐标展平并归一化
+            # ref_y, ref_x: (1, h_i*w_i); valid_ratios[:]引入了批次
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * h)
             ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * w)
-            ref = torch.stack((ref_x, ref_y), -1)  # [n, h*w, 2]
+            # ref:(b, h*w, 2)
+            ref = torch.stack((ref_x, ref_y), -1)
             reference_points_list.append(ref)
-        reference_points = torch.cat(reference_points_list, 1)  # [n, s, 2]
-        reference_points = reference_points[:, :, None] * valid_ratios[:, None]  # [n, s, l, 2]
+        # reference_points： (b, sum(h_i*w_i), 2)
+        reference_points = torch.cat(reference_points_list, 1)
+        # reference_points: (n, sum(h_i*w_i), l, 2)
+        # 参考点实际上代表的是图像空间中的位置，而不仅仅是特定特征图上的像素
+        reference_points = reference_points[:, :, None] * valid_ratios[:, None]
         return reference_points
 
     def forward(
@@ -605,22 +625,38 @@ class HoughTransformerEncoder(nn.Module):
         focus_token_nums=None,
         foreground_inds=None,
         multi_level_masks=None,
+        # heat_maps input [(b, h_i*w_i, num_classes)]
+        heat_maps=None
     ):
+        # reference_points: (b, num_total_queries, num_levels, 2(x,y))
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=query.device)
         b, n, s, p = reference_points.shape
         ori_reference_points = reference_points
         ori_pos = query_pos
         value = output = query
+        # each encoder layer
         for layer_id, layer in enumerate(self.layers):
+            # foreground_inds[layer_id]: (b, num_selected_queries)
+            # .unsqueeze(-1): (b, num_selected_queries, 1)
+            # .expand(): (b, num_selected_queries, embed_dim)
+            # inds_for_query: (b, num_queries_for_layer, embed_dim)
             inds_for_query = foreground_inds[layer_id].unsqueeze(-1).expand(-1, -1, self.embed_dim)
+            # query: (b, num_queries_for_layer, embed_dim)
             query = torch.gather(output, 1, inds_for_query)
+            # query_pos: (b, num_queries_for_layer, embed_dim)
             query_pos = torch.gather(ori_pos, 1, inds_for_query)
+            # 获取前一层的前景分数 (b, num_queries_for_layer)
             foreground_pre_layer = torch.gather(foreground_score, 1, foreground_inds[layer_id])
+            # reference_points: (b, num_queries_for_layer, num_levels, 2)
             reference_points = torch.gather(
                 ori_reference_points.view(b, n, -1), 1,
                 foreground_inds[layer_id].unsqueeze(-1).repeat(1, 1, s * p)
             ).view(b, -1, s, p)
+            # 增强多类别单点预测 score_tgt:(b, num_queries_for_layer, num_classes)
+            #???可能可以利用hough进行优化
             score_tgt = self.enhance_mcsp(query)
+            # 创建一个新的张量并赋值给 query，而 output 仍然指向原始张量
+            # 当前 Transformer 层处理查询 query:(b, num_queries_for_layer, embed_dim)
             query = layer(
                 query,
                 query_pos,
@@ -633,9 +669,16 @@ class HoughTransformerEncoder(nn.Module):
                 foreground_pre_layer,
             )
             outputs = []
+            # 遍历批次中的每个样 batch_size
+            # query 现在包含了更新后的特征，但只针对选定的前景查询点
+            # output 仍然保持着原始的、完整的特征图
+            # 我们需要将更新后的前景查询点特征（在 query 中）合并回完整的特征图（在 output 中）
             for i in range(foreground_inds[layer_id].shape[0]):
+                # (focus_tokens_for_sample,)
                 foreground_inds_no_pad = foreground_inds[layer_id][i][:focus_token_nums[i]]
+                # (focus_tokens_for_sample, embed_dim)
                 query_no_pad = query[i][:focus_token_nums[i]]
+                # query_no_pad 中的值散布到 output[i] 中，位置由 foreground_inds_no_pad 决定
                 outputs.append(
                     output[i].scatter(
                         0,
