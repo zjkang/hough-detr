@@ -20,7 +20,7 @@ class DETRBaseTransformer(nn.Module):
 
     @staticmethod
     def flatten_multi_level(multi_level_elements):
-        multi_level_elements = torch.cat([e.flatten(-2) for e in multi_level_elements], -1)  # (b, [c], s)
+        multi_level_elements = torch.cat([e.flatten(-2) for e in multi_level_elements], -1)  # e: (b, c, h, w)
         if multi_level_elements.ndim == 3:
             multi_level_elements.transpose_(1, 2)
         return multi_level_elements
