@@ -208,9 +208,12 @@ class HoughTransformer(TwostageTransformer):
         self.decoder = decoder
         self.tgt_embed = nn.Embedding(two_stage_num_proposals, self.embed_dim)
         self.encoder_class_head = nn.Linear(self.embed_dim, num_classes)
+        # input dimension: embed_dim, hidden dimension: embed_dim
+        # 4: x,y,width,height, 3: # of layers
         self.encoder_bbox_head = MLP(self.embed_dim, self.embed_dim, 4, 3)
         self.encoder.enhance_mcsp = self.encoder_class_head
-        self.enc_mask_voting_hm_predictor = HeatmapPredictor(self.num_classes, self.embed_dim, self.vote_field_size)
+        self.enc_mask_voting_hm_predictor = HeatmapPredictor(
+            self.num_classes, self.embed_dim, self.vote_field_size)
 
         self.init_weights()
 
@@ -229,12 +232,12 @@ class HoughTransformer(TwostageTransformer):
 
     def forward(
         self,
-        multi_level_feats,
-        multi_level_masks,
-        multi_level_pos_embeds,
-        noised_label_query,
-        noised_box_query,
-        attn_mask,
+        multi_level_feats, # [(b,c,h_i,w_i)]
+        multi_level_masks, # [(b,h_i,w_i)]
+        multi_level_pos_embeds, # [(b,c,h_i,w_i)]
+        noised_label_query, # (b,n_noise,c), n_noise: Number of noised queries
+        noised_box_query, # (b,n_noise,4)
+        attn_mask, # ???(b,n_q,n_q), n_q: number of queries
     ):
         # get input for encoder
         # feat_flatten: (b, sum(h_i * w_i), c=embed_dim)
@@ -262,7 +265,7 @@ class HoughTransformer(TwostageTransformer):
         # focus_token_nums: (b,)
         focus_token_nums = focus_token_nums.sum(-1)
 
-        # Generate heatmaps for each level
+        # generate hm voting for each level
         batch_size = feat_flatten.shape[0]
         heat_maps = []
         selected_score = []
@@ -271,11 +274,11 @@ class HoughTransformer(TwostageTransformer):
         for level_idx in range(spatial_shapes.shape[0] - 1, -1, -1):
             start_index = level_start_index[level_idx]
             end_index = level_start_index[level_idx + 1] if level_idx < spatial_shapes.shape[0] - 1 else None
-            # level_memory: (b, h_i * w_i, channels)
+            # level_memory: (b, h_i * w_i, c)
             level_memory = backbone_output_memory[:, start_index:end_index, :]
             # mask: (b, h_i * w_i)
             mask = mask_flatten[:, start_index:end_index]
-            # Reshape level_memory to match spatial dimensions, (b, channels, h_i, w_i)
+            # reshape level_memory to match spatial dimensions (b, c, h_i, w_i)
             level_memory = level_memory.permute(0, 2, 1).view(batch_size, -1, *spatial_shapes[level_idx])
 
             if level_idx != spatial_shapes.shape[0] - 1:
@@ -287,13 +290,30 @@ class HoughTransformer(TwostageTransformer):
                     align_corners=True
                 )
 
-            # Generate hm voting
             # heat_map:(b, num_classes, h_i, w_i)
             heat_map = self.enc_mask_voting_hm_predictor(level_memory)
             # heat_map:(b, num_classes, h_i, w_i) -> (b, h_i*w_i, num_classes)
-            heat_map = heat_map.permute(0, 2, 3, 1).reshape(batch_size, -1, self.num_classes)
+            heat_map = heat_map.permute(0, 2, 3, 1).view(batch_size, -1, self.num_classes)
             heat_maps.append(heat_map)
 
+            # 方法1：简单求和
+            # foreground_score = heat_map.sum(dim=-1)
+
+            # # 方法2：归一化后求和
+            # normalized_heat_map = F.softmax(heat_map, dim=-1)
+            # foreground_score = normalized_heat_map.sum(dim=-1)
+
+            # # 方法3：取最大值
+            # foreground_score, _ = heat_map.max(dim=-1)
+
+            # # 方法4：加权求和（假设我们有一个权重向量）
+            # weights = torch.tensor([w1, w2, ..., wn]).to(heat_map.device)
+            # foreground_score = (heat_map * weights).sum(dim=-1)
+
+            # # 方法5：阈值处理后求和
+            # threshold = 0.5
+            # thresholded_heat_map = heat_map * (heat_map > threshold)
+            # foreground_score = thresholded_heat_map.sum(dim=-1)
             # score:(b, h_i*w_i, 1)
             score = heat_map.sum(dim=-1, keepdim=True)
             # valid_score:(b, h_i*w_i)
@@ -375,7 +395,7 @@ class HoughTransformer(TwostageTransformer):
 
         # get encoder output, classes and coordinates
         # output_memory: (b, sum(h_i*w_i), embed_dim)
-        # output_proposals: (b, sum(h_i*w_i), 4)    
+        # output_proposals: (b, sum(h_i*w_i), 4)
         output_memory, output_proposals = self.gen_encoder_output_proposals(
             memory, mask_flatten, spatial_shapes
         )
@@ -383,7 +403,7 @@ class HoughTransformer(TwostageTransformer):
         enc_outputs_class = self.encoder_class_head(output_memory)
         # enc_outputs_coord: (b, sum(h_i*w_i), 4)
         enc_outputs_coord = self.encoder_bbox_head(output_memory) + output_proposals
-        # enc_outputs_coord: (b, sum(h_i*w_i), 4)   
+        # enc_outputs_coord: (b, sum(h_i*w_i), 4)
         enc_outputs_coord = enc_outputs_coord.sigmoid()
 
         # get topk output classes and coordinates
@@ -397,7 +417,7 @@ class HoughTransformer(TwostageTransformer):
         # topk_index: (b, min_num): min_num 是每个图像中 NMS 后保留的预测数量 < topk
         topk_index = self.nms_on_topk_index(
             topk_scores, topk_index, spatial_shapes, level_start_index, iou_threshold=0.3
-        ).unsqueeze(-1) 
+        ).unsqueeze(-1)
         # enc_outputs_class: (b, min_num, num_classes)
         enc_outputs_class = enc_outputs_class.gather(1, topk_index.expand(-1, -1, self.num_classes))
         # enc_outputs_coord: (b, min_num, 4)
