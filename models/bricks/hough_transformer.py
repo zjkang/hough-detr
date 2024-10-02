@@ -64,7 +64,6 @@ class HeatmapPredictor(nn.Module):
         self.region_num = region_num
         self.num_classes = num_classes
         self.vote_field_size = vote_field_size
-        self.embed_dim = embed_dim
         self.head_conv = head_conv
         self.deconv_layers = self._make_deconv_layer2(
             3,
@@ -74,8 +73,9 @@ class HeatmapPredictor(nn.Module):
         # voting-map vs voting diff
         # voting-map is learnable, voting is aggregated result from Hough
         # learn to generate voting-map
+        num_output = self.num_classes * self.region_num
         self.voting_map_hm = nn.Sequential(
-            nn.Conv2d(self.embed_dim, self.head_conv,
+            nn.Conv2d(self.inplanes, self.head_conv,
                 kernel_size=3, padding=1, bias=True),
             nn.ReLU(inplace=True),
             nn.Conv2d(self.head_conv, self.num_classes,
@@ -148,12 +148,12 @@ class HeatmapPredictor(nn.Module):
 
     # x: (b, c=embed_dim, h, w)
     def forward(self, x):
-        # x = (b, region_num * num_classes, h, w)
+        # x: (b, region_num * num_classes, h, w)
         # NOTE!!! does it need to add this?
-        x = self.deconv_layers(x)
-        # x = (b, region_num * num_classes, h, w)
+        # x = self.deconv_layers(x)
+        # x: (b, region_num * num_classes, h, w)
         x = self.voting_map_hm(x)
-        # out = (b, num_classes, h, w)
+        # out: (b, num_classes, h, w)
         out = self.voting_hm(x)
         return out
 
@@ -294,7 +294,6 @@ class HoughTransformer(TwostageTransformer):
             heat_map = self.enc_mask_voting_hm_predictor(level_memory)
             # heat_map:(b, num_classes, h_i, w_i) -> (b, h_i*w_i, num_classes)
             heat_map = heat_map.permute(0, 2, 3, 1).view(batch_size, -1, self.num_classes)
-            heat_maps.append(heat_map)
 
             # 方法1：简单求和
             # foreground_score = heat_map.sum(dim=-1)
@@ -315,7 +314,7 @@ class HoughTransformer(TwostageTransformer):
             # thresholded_heat_map = heat_map * (heat_map > threshold)
             # foreground_score = thresholded_heat_map.sum(dim=-1)
             # score:(b, h_i*w_i, 1)
-            score = heat_map.sum(dim=-1, keepdim=True)
+            score = heat_map.max(dim=-1, keepdim=True)
             # valid_score:(b, h_i*w_i)
             valid_score = score.squeeze(-1).masked_fill(mask, score.min())
             # score:(b, h_i*w_i, 1) -> (b, 1, h_i, w_i)
@@ -327,6 +326,10 @@ class HoughTransformer(TwostageTransformer):
                 level_token_nums[level_idx], dim=1)
             # level_inds:(b, k) -> to flatten index
             level_inds = level_inds + level_start_index[level_idx]
+
+            # heat_map: (b, num_classes, h_i, w_i)
+            heat_map.transpose(1, 2).view(batch_size, -1, *spatial_shapes[level_idx])
+            heat_maps.append(heat_map)
 
             salience_score.append(score)
             selected_inds.append(level_inds)
@@ -353,15 +356,17 @@ class HoughTransformer(TwostageTransformer):
         # selected_inds: [[d1,d2,d_r]]: selected foreground index each layer
         selected_inds = [selected_inds[:, :r] for r in layer_filter_ratio]
         # 反转 salience_score 列表，使其从低层级到高层级排列
-        # salience_score: [(b, 1, h_i*w_i)]
+        # salience_score: [(b, 1, h_i, w_i)]
         salience_score = salience_score[::-1]
         # foreground_score: (b,sum(h_i*w_i))
         foreground_score = self.flatten_multi_level(salience_score).squeeze(-1)
         # foreground_score: (b,sum(h_i*w_i))
         foreground_score = foreground_score.masked_fill(mask_flatten, foreground_score.min())
 
-        # heat_maps: [(b, h_i*w_i, num_classes)] -> (b, sum(h_i*w_i), num_classes)
-        heat_maps = torch.cat(heat_maps[::-1], dim=1)
+        # heat_maps: [(b, num_classes, h_i, w_i)]
+        heat_maps = heat_maps[::-1]
+        # foreground_heat_map: (b, sum(h_i*w_i), num_classes)
+        foreground_heat_map = self.flatten_multi_level(heat_maps)
 
         # transformer encoder
         # memory: (batch_size, sum(h_i * w_i), embed_dim)
@@ -377,9 +382,11 @@ class HoughTransformer(TwostageTransformer):
             focus_token_nums=focus_token_nums,
             foreground_inds=selected_inds,
             multi_level_masks=multi_level_masks,
-            heat_maps=heat_maps
+            # heat map inputs
+            heat_maps=foreground_heat_map
         )
 
+        # neck特征融合是在encoder之后做的
         if self.neck is not None:
             # feat_unflatten: tuple((b, embed_dim, h_i*w_i),)
             feat_unflatten = memory.split(spatial_shapes.prod(-1).unbind(), dim=1)
@@ -411,7 +418,7 @@ class HoughTransformer(TwostageTransformer):
             topk = torch.min(torch.tensor(self.two_stage_num_proposals * 4), enc_outputs_class.shape[1])
         else:
             topk = min(self.two_stage_num_proposals * 4, enc_outputs_class.shape[1])
-        # topk_scores: (b, topk), topk_index: (b, topk)
+        # topk_scores: (b, topk), topk_index: (b, topk) 降序
         topk_scores, topk_index = torch.topk(enc_outputs_class.max(-1)[0], topk, dim=1)
         # 使用 NMS 算法对 topk_scores 和 topk_index 进行处理，以抑制重复的预测
         # topk_index: (b, min_num): min_num 是每个图像中 NMS 后保留的预测数量 < topk

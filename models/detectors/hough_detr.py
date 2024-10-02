@@ -6,7 +6,7 @@ from torch.nn import functional as F
 from torchvision.ops import boxes as box_ops
 
 from models.bricks.denoising import GenerateCDNQueries
-from models.bricks.losses import sigmoid_focal_loss
+from models.bricks.losses import sigmoid_focal_loss, weighted_multi_class_focal_loss
 from models.detectors.base_detector import DNDETRDetector
 
 
@@ -49,10 +49,10 @@ class SalienceCriterion(nn.Module):
             mask_targets.append(masks_per_level)
         # mask_targets: (batch_size, sum(h_i*w_i))
         mask_targets = torch.cat(mask_targets, dim=1)
-        # foreground_mask init: [(batch_size, 1, H_i, W_i)]
-        # then (batch_size, 1, H_i * W_i)
+        # foreground_mask init: [(batch_size, 1, h_i, w_i)]
+        # then (batch_size, 1, h_i * w_i)
         foreground_mask = torch.cat([e.flatten(-2) for e in foreground_mask], -1)
-        # foreground_mask: (batch_size, sum(H_i * W_i))
+        # foreground_mask: (batch_size, sum(h_i * w_i))
         foreground_mask = foreground_mask.squeeze(1)
         num_pos = torch.sum(mask_targets > 0.5 * self.noise_scale).clamp_(min=1)
         salience_loss = (
@@ -146,48 +146,55 @@ class HoughCriterion(nn.Module):
         noise_scale: float = 0.0,
         alpha: float = 0.25,
         gamma: float = 2.0,
+        num_classes: int = 91
     ):
         super().__init__()
         self.limit_range = limit_range
         self.noise_scale = noise_scale
         self.alpha = alpha
         self.gamma = gamma
+        self.num_classes = num_classes
 
-    def forward(self, foreground_mask, targets, feature_strides, image_sizes):
-        # foreground_mask: [(batch_size, 1, H_i, W_i)]
-        # gt_boxes_list: [boxes] len() = batch, boxes: the boxes in one image
+    def forward(self, heat_maps, targets, feature_strides, image_sizes):
+        # heat_maps(foreground_mask): [(b, num_classes, h_i, w_i)]
+        # gt_boxes_list: [{boxes, labels}] len() = batch, boxes: the boxes in one image
+        # ground-truth target real coords
         gt_boxes_list = []
         for t, (img_h, img_w) in zip(targets, image_sizes):
             boxes = t["boxes"]
+            labels = t["labels"]
             boxes = box_ops._box_cxcywh_to_xyxy(boxes)
             scale_factor = torch.tensor([img_w, img_h, img_w, img_h], device=boxes.device)
-            gt_boxes_list.append(boxes * scale_factor)
+            gt_boxes_list.append((boxes * scale_factor), labels)
 
         mask_targets = []
-        for level_idx, (mask, feature_stride) in enumerate(zip(foreground_mask, feature_strides)):
-            feature_shape = mask.shape[-2:]
+        for level_idx, (heat_map, feature_stride) in enumerate(zip(heat_maps, feature_strides)):
+            feature_shape = heat_map.shape[-2:]
             coord_x, coord_y = self.get_pixel_coordinate(feature_shape, feature_stride, device=mask.device)
             masks_per_level = []
-            for gt_boxes in gt_boxes_list:
-                mask = self.get_mask_single_level(coord_x, coord_y, gt_boxes, level_idx)
+            for gt_boxes, labels in gt_boxes_list:
+                mask = self.get_mask_single_level(coord_x, coord_y, gt_boxes, labels, level_idx)
                 masks_per_level.append(mask)
-
+            # (masks_per_level: batch_size, num_classes, h_i * w_i)
             masks_per_level = torch.stack(masks_per_level)
             mask_targets.append(masks_per_level)
-        mask_targets = torch.cat(mask_targets, dim=1)
-        foreground_mask = torch.cat([e.flatten(-2) for e in foreground_mask], -1)
-        foreground_mask = foreground_mask.squeeze(1)
+        # mask_targets: (batch_size, num_classes, sum(h_i * w_i))
+        mask_targets = torch.cat(mask_targets, dim=2)
+
+        # heat_maps: (batch_size, num_classes, sum(h_i * w_i))
+        heat_maps = torch.cat([e.flatten(-2) for e in heat_maps], -1)
+        # num_pos: (batch_size, num_classes)
         num_pos = torch.sum(mask_targets > 0.5 * self.noise_scale).clamp_(min=1)
-        salience_loss = (
-            sigmoid_focal_loss(
-                foreground_mask,
+        heat_map_loss = (
+            weighted_multi_class_focal_loss(
+                heat_maps,
                 mask_targets,
                 num_pos,
                 alpha=self.alpha,
                 gamma=self.gamma,
-            ) * foreground_mask.shape[1]
+            ) * heat_maps.shape[2]
         )
-        return {"loss_salience": salience_loss}
+        return {"loss_heat_map": heat_map_loss}
 
     def get_pixel_coordinate(self, feature_shape, stride, device):
         height, width = feature_shape
@@ -200,8 +207,9 @@ class HoughCriterion(nn.Module):
         coord_x = coord_x.reshape(-1)
         return coord_x, coord_y
 
-    def get_mask_single_level(self, coord_x, coord_y, gt_boxes, level_idx):
-        # gt_label: (m,) gt_boxes: (m, 4)
+    def get_mask_single_level(self, coord_x, coord_y, gt_boxes, labels, level_idx):
+        # TODO: alternative gaussian to calculate point confidence
+        # labels: (m,) gt_boxes: (m, 4)
         # coord_x: (h*w, )
         left_border_distance = coord_x[:, None] - gt_boxes[None, :, 0]  # (h*w, m)
         top_border_distance = coord_y[:, None] - gt_boxes[None, :, 1]
@@ -225,24 +233,38 @@ class HoughCriterion(nn.Module):
         # scale-independent salience confidence
         row_factor = left_border_distance + right_border_distance
         col_factor = top_border_distance + bottom_border_distance
+        # delta_x, delta_y, range [-1,1]
         delta_x = (left_border_distance - right_border_distance) / row_factor
         delta_y = (top_border_distance - bottom_border_distance) / col_factor
+        # confidence range [0, 0.707], related the relative dist from point to boundary rather than absolute dist
         confidence = torch.sqrt(delta_x**2 + delta_y**2) / 2
 
+        # confidence_per_box: (h * w, m), m is # of boxes
         confidence_per_box = 1 - confidence
         confidence_per_box[~mask_in_gt_boxes] = 0
 
-        # process positive coordinates
-        if confidence_per_box.numel() != 0:
-            mask = confidence_per_box.max(-1)[0]
-        else:
-            mask = torch.zeros(coord_y.shape, device=confidence.device, dtype=confidence.dtype)
+        # 创建一个包含所有类别的掩码
+        mask = torch.zeros((coord_y.shape[0], self.num_classes), device=confidence.device, dtype=confidence.dtype)
 
-        # process negative coordinates
-        mask_pos = mask_pos.long().sum(dim=-1) >= 1
-        mask[~mask_pos] = 0
+        # 为每个类别分别处理
+        for class_id in range(self.num_classes):
+            class_mask = labels == class_id # [T,F,...T,F]
+            if class_mask.sum() > 0:
+                class_confidence = confidence_per_box[:, class_mask]
+                class_mask_pos = mask_pos[:, class_mask]
+
+                if class_confidence.numel() != 0:
+                    class_mask_values = class_confidence.max(-1)[0]
+                else:
+                    class_mask_values = torch.zeros(coord_y.shape, device=confidence.device, dtype=confidence.dtype)
+
+                class_mask_pos = class_mask_pos.long().sum(dim=-1) >= 1
+                class_mask_values[~class_mask_pos] = 0
+
+                mask[:, class_id] = class_mask_values
 
         # add noise to add randomness
+        # mask: (h*w, num_classes)
         mask = (1 - self.noise_scale) * mask + self.noise_scale * torch.rand_like(mask)
         return mask
 
@@ -260,7 +282,7 @@ class HoughDETR(DNDETRDetector):
         focus_criterion: nn.Module,
         hough_criterion: nn.Module,
         # model parameters
-        num_classes: int = 91,
+        num_classes: int = 91, # 数据集有 80 个已标注的物体类别（类）。然而，有些代码中可能会设置为 91 个类别，这是因为 COCO 数据集中存在 11 个没有被使用或没有标注的背景类（或者称为未使用的类别 ID）。这些额外的类别 ID 从 81 到 91，包括了某些没有被标注的物体
         num_queries: int = 900,
         denoising_nums: int = 100,
         # model variants
@@ -294,11 +316,11 @@ class HoughDETR(DNDETRDetector):
 
     def forward(self, images: List[Tensor], targets: List[Dict] = None):
         # get original image sizes, used for postprocess
-        # original_image_sizes: [(h1,w1), ..., hb, wb], b is batch size
+        # original_image_sizes: [(h_1,w_1), ..., (h_b, w_b)], b is batch size
         original_image_sizes = self.query_original_sizes(images)
         # different h,w will align into h_max, w_max with padding
         # images: (b,c,H,W): ImageList object,image_size: original size of the image
-        # targets: [{},{}]: 列表长度等于批次大小，每个字典包含 "boxes"、"labels" 等键,
+        # targets: [{boxes:,labels:}]: 列表长度等于批次大小，每个字典包含 "boxes"、"labels" 等键,
         #          "boxes": 多个 cxcywh的表示,并且根据图片h,w做归一化
         # mask: (b,H,W): image区域是0,padding是1
         images, targets, mask = self.preprocess(images, targets)
@@ -339,10 +361,11 @@ class HoughDETR(DNDETRDetector):
         #    num_layers 是解码器的层数
         #    num_queries 是查询的数量，通常等于目标检测的最大对象数
         # outputs_coord: (num_layers, batch_size, num_queries, 4)
-        # enc_class: (batch_size, num_proposals, num_classes)
-        # enc_coord: (batch_size, num_proposals, 4)
-        # foreground_mask: salience_score [(batch_size, num_classes, H_i, W_i)]
-        outputs_class, outputs_coord, enc_class, enc_coord, foreground_mask = self.transformer(
+        # enc_class: (b, num_proposals, num_classes)
+        # enc_coord: (b, num_proposals, 4)
+        # foreground_mask: salience_score [(b, 1, h_i, w_i)]
+        # foreground_heat_map: [(b, num_classes, h_i, w_i)]
+        outputs_class, outputs_coord, enc_class, enc_coord, foreground_mask, heat_map = self.transformer(
             multi_level_feats,
             multi_level_masks,
             multi_level_position_embeddings,
@@ -381,11 +404,13 @@ class HoughDETR(DNDETRDetector):
                 images.tensors.shape[-2] / feature.shape[-2],
                 images.tensors.shape[-1] / feature.shape[-1],
             ) for feature in multi_level_feats]
+
             focus_loss = self.focus_criterion(foreground_mask, targets, feature_stride, images.image_sizes)
             loss_dict.update(focus_loss)
 
             # compute hm hough loss
-
+            hough_loss = self.hough_criterion(heat_map, targets,feature_stride, images.image_sizes)
+            loss_dict.update(hough_loss)
 
             # loss reweighting
             weight_dict = self.criterion.weight_dict
