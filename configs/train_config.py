@@ -17,27 +17,28 @@ output_dir = None  # path to save checkpoints, default for None: checkpoints/{mo
 find_unused_parameters = False  # useful for debugging distributed training
 
 # define dataset for train
-coco_path = "data/coco"  # /PATH/TO/YOUR/COCODIR
+coco_path = "../autodl-tmp/data/COCO2017-debug"  # /PATH/TO/YOUR/COCODIR
 train_transform = presets.detr  # see transforms/presets to choose a transform
 train_dataset = CocoDetection(
-    img_folder=f"{coco_path}/train2017",
+    img_folder=f"{coco_path}/images/train2017",
     ann_file=f"{coco_path}/annotations/instances_train2017.json",
     transforms=train_transform,
     train=True,
 )
 test_dataset = CocoDetection(
-    img_folder=f"{coco_path}/val2017",
+    img_folder=f"{coco_path}/images/val2017",
     ann_file=f"{coco_path}/annotations/instances_val2017.json",
     transforms=None,  # the eval_transform is integrated in the model
 )
 
 # model config to train
-model_path = "configs/salience_detr/salience_detr_resnet50_800_1333.py"
+model_path = "configs/hough_detr/hough_detr_resnet50_800_1333.py"
 
 # specify a checkpoint folder to resume, or a pretrained ".pth" to finetune, for example:
 # checkpoints/salience_detr_resnet50_800_1333/train/2024-03-22-09_38_50
 # checkpoints/salience_detr_resnet50_800_1333/train/2024-03-22-09_38_50/best_ap.pth
-resume_from_checkpoint = checkpoints/salience_detr_resnet50_800_1333/train/2024-03-22-09_38_50
+#resume_from_checkpoint = 'checkpoints/salience_detr_resnet50_800_1333/train/2024-03-22-09_38_50'
+resume_from_checkpoint = None
 
 learning_rate = 1e-4  # initial learning rate
 optimizer = optim.AdamW(lr=learning_rate, weight_decay=1e-4, betas=(0.9, 0.999))

@@ -5,15 +5,15 @@ from models.backbones.resnet import ResNetBackbone
 from models.bricks.misc import FrozenBatchNorm2d
 from models.bricks.position_encoding import PositionEmbeddingSine
 from models.bricks.post_process import PostProcess
-from models.bricks.salience_transformer import (
-    SalienceTransformer,
-    SalienceTransformerDecoder,
-    SalienceTransformerDecoderLayer,
-    SalienceTransformerEncoder,
-    SalienceTransformerEncoderLayer,
+from models.bricks.hough_transformer import (
+    HoughTransformer,
+    HoughTransformerDecoder,
+    HoughTransformerDecoderLayer,
+    HoughTransformerEncoder,
+    HoughTransformerEncoderLayer,
 )
 from models.bricks.set_criterion import HybridSetCriterion
-from models.detectors.salience_detr import SalienceCriterion, SalienceDETR
+from models.detectors.hough_detr import HoughCriterion, HoughDETR
 from models.matcher.hungarian_matcher import HungarianMatcher
 from models.necks.channel_mapper import ChannelMapper
 from models.necks.repnet import RepVGGPluXNetwork
@@ -41,9 +41,9 @@ neck = ChannelMapper(
     num_outs=num_feature_levels,
 )
 
-transformer = SalienceTransformer(
-    encoder=SalienceTransformerEncoder(
-        encoder_layer=SalienceTransformerEncoderLayer(
+transformer = HoughTransformer(
+    encoder=HoughTransformerEncoder(
+        encoder_layer=HoughTransformerEncoderLayer(
             embed_dim=embed_dim,
             n_heads=num_heads,
             dropout=0.0,
@@ -61,8 +61,8 @@ transformer = SalienceTransformer(
         activation=nn.SiLU,
         groups=4,
     ),
-    decoder=SalienceTransformerDecoder(
-        decoder_layer=SalienceTransformerDecoderLayer(
+    decoder=HoughTransformerDecoder(
+        decoder_layer=HoughTransformerDecoderLayer(
             embed_dim=embed_dim,
             n_heads=num_heads,
             dropout=0.0,
@@ -91,21 +91,21 @@ weight_dict.update({
     for k, v in weight_dict.items()
 })
 weight_dict.update({"loss_class_enc": 1, "loss_bbox_enc": 5, "loss_giou_enc": 2})
-weight_dict.update({"loss_salience": 2})
+weight_dict.update({"loss_hough": 2})
 
 criterion = HybridSetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict, alpha=0.25, gamma=2.0)
-foreground_criterion = SalienceCriterion(noise_scale=0.0, alpha=0.25, gamma=2.0)
+hough_criterion = HoughCriterion(noise_scale=0.0, alpha=0.25, gamma=2.0)
 postprocessor = PostProcess(select_box_nums_for_evaluation=300)
 
 # combine above components to instantiate the model
-model = SalienceDETR(
+model = HoughDETR(
     backbone=backbone,
     neck=neck,
     position_embedding=position_embedding,
     transformer=transformer,
     criterion=criterion,
-    focus_criterion=foreground_criterion,
     postprocessor=postprocessor,
+    hough_criterion=hough_criterion,
     num_classes=num_classes,
     num_queries=num_queries,
     aux_loss=True,
