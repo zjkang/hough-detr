@@ -237,7 +237,7 @@ class HoughTransformer(TwostageTransformer):
         multi_level_pos_embeds, # [(b,c,h_i,w_i)]
         noised_label_query, # (b,n_noise,c), n_noise: Number of noised queries
         noised_box_query, # (b,n_noise,4)
-        attn_mask, # ???(b,n_q,n_q), n_q: number of queries
+        attn_mask, # ???(b,n_q,n_q), n_q: number of queries = n_noise?
     ):
         # get input for encoder
         # feat_flatten: (b, sum(h_i * w_i), c=embed_dim)
@@ -609,7 +609,7 @@ class HoughTransformerEncoderLayer(nn.Module):
         score_tgt=None,
         foreground_pre_layer=None,
     ):
-        # multi-class score: (b, num_queries, num_classes)
+        # multi-class score: (b, num_queries)
         mc_score = score_tgt.max(-1)[0] * foreground_pre_layer
         # select_tgt_index: (b, topk_sa)
         select_tgt_index = torch.topk(mc_score, self.topk_sa, dim=1)[1]

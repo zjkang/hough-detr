@@ -138,7 +138,16 @@ from models.detectors.base_detector import DNDETRDetector
 #         return mask # confidence score & 0
 
 
-# loss function optimization
+# NOTE: potential improvement:
+# 1. heat map design
+#    (1): distance -> confidence (x)
+#    (2): gaussian conv
+# 2. loss function
+#    (1) focal loss with positive / negative (x)
+#    (2) focal loss with weights
+#    (3) cornernet: only center or few points as positive, negative with weights
+# 3. Do I need to select tokens (pixels) in multi-scales
+#       high resolution (small object); low (large object)
 class HoughCriterion(nn.Module):
     def __init__(
         self,
@@ -170,13 +179,17 @@ class HoughCriterion(nn.Module):
         mask_targets = []
         for level_idx, (heat_map, feature_stride) in enumerate(zip(heat_maps, feature_strides)):
             feature_shape = heat_map.shape[-2:]
-            coord_x, coord_y = self.get_pixel_coordinate(feature_shape, feature_stride, device=mask.device)
+            coord_x, coord_y = self.get_pixel_coordinate(
+                feature_shape, feature_stride, device=mask.device)
             masks_per_level = []
             for gt_boxes, labels in gt_boxes_list:
+                # mask: (h_i * w_i, num_classes)
                 mask = self.get_mask_single_level(coord_x, coord_y, gt_boxes, labels, level_idx)
                 masks_per_level.append(mask)
-            # (masks_per_level: batch_size, num_classes, h_i * w_i)
+            # (masks_per_level: (batch_size, h_i * w_i, num_classes)
             masks_per_level = torch.stack(masks_per_level)
+            # masks_per_level: (batch_size, num_classes, h_i * w_i)
+            masks_per_level = masks_per_level.permute(0, 2, 1)
             mask_targets.append(masks_per_level)
         # mask_targets: (batch_size, num_classes, sum(h_i * w_i))
         mask_targets = torch.cat(mask_targets, dim=2)
@@ -264,7 +277,7 @@ class HoughCriterion(nn.Module):
                 mask[:, class_id] = class_mask_values
 
         # add noise to add randomness
-        # mask: (h*w, num_classes)
+        # mask: (h_i * w_i, num_classes)
         mask = (1 - self.noise_scale) * mask + self.noise_scale * torch.rand_like(mask)
         return mask
 
@@ -319,10 +332,10 @@ class HoughDETR(DNDETRDetector):
         # original_image_sizes: [(h_1,w_1), ..., (h_b, w_b)], b is batch size
         original_image_sizes = self.query_original_sizes(images)
         # different h,w will align into h_max, w_max with padding
-        # images: (b,c,H,W): ImageList object,image_size: original size of the image
+        # images: (b,c,h,w): ImageList object,image_size: original size of the image
         # targets: [{boxes:,labels:}]: 列表长度等于批次大小，每个字典包含 "boxes"、"labels" 等键,
         #          "boxes": 多个 cxcywh的表示,并且根据图片h,w做归一化
-        # mask: (b,H,W): image区域是0,padding是1
+        # mask: (b,h,w): image区域是0,padding是1
         images, targets, mask = self.preprocess(images, targets)
 
         # extract features
@@ -357,10 +370,10 @@ class HoughDETR(DNDETRDetector):
             max_gt_num_per_image = None
 
         # feed into transformer
-        # outputs_class: (num_layers, batch_size, num_queries, num_classes)
+        # outputs_class: (num_layers, b, num_queries, num_classes)
         #    num_layers 是解码器的层数
         #    num_queries 是查询的数量，通常等于目标检测的最大对象数
-        # outputs_coord: (num_layers, batch_size, num_queries, 4)
+        # outputs_coord: (num_layers, b, num_queries, 4)
         # enc_class: (b, num_proposals, num_classes)
         # enc_coord: (b, num_proposals, 4)
         # foreground_mask: salience_score [(b, 1, h_i, w_i)]
@@ -391,6 +404,9 @@ class HoughDETR(DNDETRDetector):
             output["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord)
 
         # prepare two stage output
+        # enc_class 和 enc_coord 是从编码器（encoder）输出的初步预测结果
+        # 这些初步预测结果会在后续的解码器（decoder）阶段被进一步精炼。通过包含这些编码器输出，
+        # 模型可以在训练过程中对这个初步预测进行监督，从而提高整体的检测性能
         output["enc_outputs"] = {"pred_logits": enc_class, "pred_boxes": enc_coord}
 
         if self.training:
@@ -405,10 +421,11 @@ class HoughDETR(DNDETRDetector):
                 images.tensors.shape[-1] / feature.shape[-1],
             ) for feature in multi_level_feats]
 
-            focus_loss = self.focus_criterion(foreground_mask, targets, feature_stride, images.image_sizes)
-            loss_dict.update(focus_loss)
+            # ignore focus loss
+            # focus_loss = self.focus_criterion(foreground_mask, targets, feature_stride, images.image_sizes)
+            # loss_dict.update(focus_loss)
 
-            # compute hm hough loss
+            # compute hough loss
             hough_loss = self.hough_criterion(heat_map, targets,feature_stride, images.image_sizes)
             loss_dict.update(hough_loss)
 
