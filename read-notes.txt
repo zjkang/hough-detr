@@ -21,6 +21,24 @@ How to debug locally
 2. create .vscode/launch.json
 3. start launch
 
+open jupternotebook
+jupyter notebook --no-browser
+
+
 How to run
 CUDA_VISIBLE_DEVICES=0 accelerate launch main.py
+
+
+----
+conda env
+conda env list
+conda detr activate
+
+
+----
+python virtual env
+source detr/bin/activate
+
+
+
     
