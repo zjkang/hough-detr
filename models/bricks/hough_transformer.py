@@ -168,7 +168,9 @@ class HoughPredictor(nn.Module):
     def init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, std=0.001)
+                # init to 0
+                nn.init.constant_(m.weight, 0)
+                # nn.init.normal_(m.weight, std=0.001)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.ConvTranspose2d):
