@@ -11,8 +11,16 @@ Consider the below implementations:
 bricks:
     losses
 
-
-
 loss function implementations
     losses
+
+
+-----
+How to debug locally
+1. SSH remote host
+2. create .vscode/launch.json
+3. start launch
+
+How to run
+CUDA_VISIBLE_DEVICES=0 accelerate launch main.py
     

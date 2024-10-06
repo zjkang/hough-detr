@@ -51,35 +51,51 @@ class MaskPredictor(nn.Module):
 
 BN_MOMENTUM = 0.1
 
+def fill_fc_weights(layers):
+    # layers.modules() 返回该模块中的所有子模块（如卷积层、全连接层、激活函数等）
+    for m in layers.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.normal_(m.weight, std=0.001)
+            # torch.nn.init.kaiming_normal_(m.weight.data, nonlinearity='relu')
+            # torch.nn.init.xavier_normal_(m.weight.data)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
 class HeatmapPredictor(nn.Module):
     def __init__(
         self,
         num_classes,
         embed_dim,
-        region_num,
+        region_num=9,
         vote_field_size=17,
         head_conv=64):
         super().__init__()
+        self.deconv_with_bias = False
         self.inplanes = embed_dim # default=64
         self.region_num = region_num
         self.num_classes = num_classes
         self.vote_field_size = vote_field_size
         self.head_conv = head_conv
-        self.deconv_layers = self._make_deconv_layer2(
-            3,
-            [256, 128, 64],
-            [4, 4, 4],
-        )
+
+        # high resolution but with 64 channels
+        # self.deconv_layers = self._make_deconv_layer2(
+        #     3,
+        #     [256, 128, 64],
+        #     [4, 4, 4],
+        # )
+
         # voting-map vs voting diff
         # voting-map is learnable, voting is aggregated result from Hough
         # learn to generate voting-map
         num_output = self.num_classes * self.region_num
+        # voting_map_hm: (b, num_classes * region_num, h, w)
         self.voting_map_hm = nn.Sequential(
             nn.Conv2d(self.inplanes, self.head_conv,
                 kernel_size=3, padding=1, bias=True),
             nn.ReLU(inplace=True),
-            nn.Conv2d(self.head_conv, self.num_classes,
+            nn.Conv2d(self.head_conv, num_output,
                 kernel_size=1, stride=1, padding=0))
+        # voting_hm: (b, num_classes, h, w)
         self.voting_hm = Hough(
             region_num=self.region_num,
             vote_field_size=self.vote_field_size,
@@ -103,7 +119,7 @@ class HeatmapPredictor(nn.Module):
             fc = nn.Conv2d(self.inplanes, planes,
                     kernel_size=3, stride=1,
                     padding=1, dilation=1, bias=False)
-            self.fill_fc_weights(fc)
+            fill_fc_weights(fc)
             up = nn.ConvTranspose2d(
                     in_channels=planes,
                     out_channels=planes,
@@ -136,15 +152,6 @@ class HeatmapPredictor(nn.Module):
 
         return deconv_kernel, padding, output_padding
 
-    def fill_fc_weights(layers):
-        # layers.modules() 返回该模块中的所有子模块（如卷积层、全连接层、激活函数等）
-        for m in layers.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.normal_(m.weight, std=0.001)
-                # torch.nn.init.kaiming_normal_(m.weight.data, nonlinearity='relu')
-                # torch.nn.init.xavier_normal_(m.weight.data)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
 
     # x: (b, c=embed_dim, h, w)
     def forward(self, x):
@@ -213,7 +220,7 @@ class HoughTransformer(TwostageTransformer):
         self.encoder_bbox_head = MLP(self.embed_dim, self.embed_dim, 4, 3)
         self.encoder.enhance_mcsp = self.encoder_class_head
         self.enc_mask_voting_hm_predictor = HeatmapPredictor(
-            self.num_classes, self.embed_dim, self.vote_field_size)
+            self.num_classes, self.embed_dim, self.region_num, self.vote_field_size)
 
         self.init_weights()
 
@@ -281,14 +288,14 @@ class HoughTransformer(TwostageTransformer):
             # reshape level_memory to match spatial dimensions (b, c, h_i, w_i)
             level_memory = level_memory.permute(0, 2, 1).view(batch_size, -1, *spatial_shapes[level_idx])
 
-            if level_idx != spatial_shapes.shape[0] - 1:
-                # Upsample to the first level's resolution
-                heat_map = torch.nn.functional.interpolate(
-                    heat_map,
-                    size=spatial_shapes[0].unbind(),
-                    mode="bilinear",
-                    align_corners=True
-                )
+            # if level_idx != spatial_shapes.shape[0] - 1:
+            #     # Upsample to the first level's resolution
+            #     heat_map = torch.nn.functional.interpolate(
+            #         heat_map,
+            #         size=spatial_shapes[level_idx].unbind().tolist(),
+            #         mode="bilinear",
+            #         align_corners=True
+            #     )
 
             # heat_map:(b, num_classes, h_i, w_i)
             heat_map = self.enc_mask_voting_hm_predictor(level_memory)
@@ -314,7 +321,7 @@ class HoughTransformer(TwostageTransformer):
             # thresholded_heat_map = heat_map * (heat_map > threshold)
             # foreground_score = thresholded_heat_map.sum(dim=-1)
             # score:(b, h_i*w_i, 1)
-            score = heat_map.max(dim=-1, keepdim=True)
+            score, _ = heat_map.max(dim=-1, keepdim=True)
             # valid_score:(b, h_i*w_i)
             valid_score = score.squeeze(-1).masked_fill(mask, score.min())
             # score:(b, h_i*w_i, 1) -> (b, 1, h_i, w_i)
@@ -328,7 +335,7 @@ class HoughTransformer(TwostageTransformer):
             level_inds = level_inds + level_start_index[level_idx]
 
             # heat_map: (b, num_classes, h_i, w_i)
-            heat_map.transpose(1, 2).view(batch_size, -1, *spatial_shapes[level_idx])
+            heat_map = heat_map.transpose(1, 2).view(batch_size, -1, *spatial_shapes[level_idx])
             heat_maps.append(heat_map)
 
             salience_score.append(score)
@@ -636,7 +643,7 @@ class HoughTransformerEncoderLayer(nn.Module):
         # query: (b, num_queries, embed_dim)
         query = query.scatter(1, select_tgt_index, select_tgt)
 
-        # self attention
+        # self attention (deformable attention)
         src2 = self.self_attn(
             query=self.with_pos_embed(query, query_pos),
             reference_points=reference_points,

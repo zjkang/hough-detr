@@ -143,7 +143,7 @@ class Hough(nn.Module):
         #  one-hot 向量表示该像素属于哪个对数极坐标区域
         return logmap_onehot
 
-    # voting_map:(h,w,r,c)
+    # voting_map:(b,num_classes*region_num,h,w)
     def forward(self, voting_map, targets=None):
 
         if self.model_v1:
@@ -152,8 +152,8 @@ class Hough(nn.Module):
             voting_map = voting_map.permute(0, 2, 1, 3, 4)
             voting_map = voting_map.reshape(batch_size, -1, width, height)
 
-         # voting_map: h*w*r*c
-        # heatmap: (h,w,c)
+         # voting_map: (b,num_classes*region_num,h,w)
+        # heatmap: (b,num_classes, h, w)
         heatmap = self.deconv_filters(voting_map)
 
         return heatmap

@@ -1,0 +1,19 @@
+# VS Code
+.vscode/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# Specific directories
+datasets/__pycache__/
+models/backbones/__pycache__/
+models/bricks/__pycache__/
+models/detectors/__pycache__/
+models/matcher/__pycache__/
+models/necks/__pycache__/
+optimizer/__pycache__/
+transforms/__pycache__/
+transforms/v2/__pycache__/
+transforms/v2/functional/__pycache__/
+util/__pycache__/

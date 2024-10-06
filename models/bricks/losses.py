@@ -1,6 +1,7 @@
+import torch
 from torch.nn import functional as F
 
-
+# inputs, targets: (b, num_classes)
 def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
     prob = inputs.sigmoid()
     target_score = targets.to(inputs.dtype)
@@ -22,7 +23,15 @@ def weighted_multi_class_focal_loss(
     total_positive = 0
 
     for c in range(heat_maps.shape[1]):
-        class_num_pos = num_pos[c] if isinstance(num_pos, torch.Tensor) else num_pos
+        if isinstance(num_pos, torch.Tensor):
+            if num_pos.dim() == 2:  # (batch_size, num_classes)
+                class_num_pos = num_pos[:, c].sum()
+            elif num_pos.dim() == 1:  # (num_classes,)
+                class_num_pos = num_pos[c]
+            else:
+                raise ValueError(f"Unexpected shape for num_pos: {num_pos.shape}")
+        else:
+            class_num_pos = num_pos
         total_positive += class_num_pos
 
         class_loss = sigmoid_focal_loss(

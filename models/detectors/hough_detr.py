@@ -174,13 +174,13 @@ class HoughCriterion(nn.Module):
             labels = t["labels"]
             boxes = box_ops._box_cxcywh_to_xyxy(boxes)
             scale_factor = torch.tensor([img_w, img_h, img_w, img_h], device=boxes.device)
-            gt_boxes_list.append((boxes * scale_factor), labels)
+            gt_boxes_list.append(((boxes * scale_factor), labels))
 
         mask_targets = []
         for level_idx, (heat_map, feature_stride) in enumerate(zip(heat_maps, feature_strides)):
             feature_shape = heat_map.shape[-2:]
             coord_x, coord_y = self.get_pixel_coordinate(
-                feature_shape, feature_stride, device=mask.device)
+                feature_shape, feature_stride, device=heat_map.device)
             masks_per_level = []
             for gt_boxes, labels in gt_boxes_list:
                 # mask: (h_i * w_i, num_classes)
@@ -197,7 +197,7 @@ class HoughCriterion(nn.Module):
         # heat_maps: (batch_size, num_classes, sum(h_i * w_i))
         heat_maps = torch.cat([e.flatten(-2) for e in heat_maps], -1)
         # num_pos: (batch_size, num_classes)
-        num_pos = torch.sum(mask_targets > 0.5 * self.noise_scale).clamp_(min=1)
+        num_pos = torch.sum(mask_targets > 0.5 * self.noise_scale, dim=2).clamp_(min=1)
         heat_map_loss = (
             weighted_multi_class_focal_loss(
                 heat_maps,
@@ -205,9 +205,16 @@ class HoughCriterion(nn.Module):
                 num_pos,
                 alpha=self.alpha,
                 gamma=self.gamma,
-            ) * heat_maps.shape[2]
+            )
+            # weighted_multi_class_focal_loss(
+            #     heat_maps,
+            #     mask_targets,
+            #     num_pos,
+            #     alpha=self.alpha,
+            #     gamma=self.gamma,
+            # ) * heat_maps.shape[2]
         )
-        return {"loss_heat_map": heat_map_loss}
+        return {"loss_hough": heat_map_loss}
 
     def get_pixel_coordinate(self, feature_shape, stride, device):
         height, width = feature_shape
