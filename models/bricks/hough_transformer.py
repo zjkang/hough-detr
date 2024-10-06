@@ -61,7 +61,7 @@ def fill_fc_weights(layers):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-class HeatmapPredictor(nn.Module):
+class HoughPredictor(nn.Module):
     def __init__(
         self,
         num_classes,
@@ -86,22 +86,24 @@ class HeatmapPredictor(nn.Module):
 
         # voting-map vs voting diff
         # voting-map is learnable, voting is aggregated result from Hough
-        # learn to generate voting-map
         num_output = self.num_classes * self.region_num
         # voting_map_hm: (b, num_classes * region_num, h, w)
+        # 109k params
+        # self.voting_map_hm = nn.Sequential(
+        #     nn.Conv2d(self.inplanes, self.head_conv,
+        #         kernel_size=3, padding=1, bias=True),
+        #     nn.ReLU(inplace=True),
+        #     nn.Conv2d(self.head_conv, num_output,
+        #         kernel_size=1, stride=1, padding=0))
         self.voting_map_hm = nn.Sequential(
-            nn.Conv2d(self.inplanes, self.head_conv,
-                kernel_size=3, padding=1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(self.head_conv, num_output,
-                kernel_size=1, stride=1, padding=0))
-        # voting_hm: (b, num_classes, h, w)
+            nn.Conv2d(self.inplanes, num_output, kernel_size=1, stride=1, padding=0)
+        )
+        # voting_hm: (b,num_classes,h,w)
         self.voting_hm = Hough(
             region_num=self.region_num,
             vote_field_size=self.vote_field_size,
             num_classes=self.num_classes
         )
-
         self.init_weights()  # 在__init__的最后调用初始化方法
 
     def _make_deconv_layer2(self, num_layers, num_filters, num_kernels):
@@ -151,7 +153,6 @@ class HeatmapPredictor(nn.Module):
             output_padding = 0
 
         return deconv_kernel, padding, output_padding
-
 
     # x: (b, c=embed_dim, h, w)
     def forward(self, x):
@@ -219,7 +220,7 @@ class HoughTransformer(TwostageTransformer):
         # 4: x,y,width,height, 3: # of layers
         self.encoder_bbox_head = MLP(self.embed_dim, self.embed_dim, 4, 3)
         self.encoder.enhance_mcsp = self.encoder_class_head
-        self.enc_mask_voting_hm_predictor = HeatmapPredictor(
+        self.enc_mask_voting_hm_predictor = HoughPredictor(
             self.num_classes, self.embed_dim, self.region_num, self.vote_field_size)
 
         self.init_weights()

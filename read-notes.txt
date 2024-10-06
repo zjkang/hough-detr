@@ -39,6 +39,3 @@ conda detr activate
 python virtual env
 source detr/bin/activate
 
-
-
-    

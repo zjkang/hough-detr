@@ -79,6 +79,9 @@ transformer = HoughTransformer(
     two_stage_num_proposals=num_queries,
     level_filter_ratio=(0.4, 0.8, 1.0, 1.0),
     layer_filter_ratio=(1.0, 0.8, 0.6, 0.6, 0.4, 0.2),
+    # hough parameters
+    region_num= 17,
+    vote_field_size= 65
 )
 
 matcher = HungarianMatcher(cost_class=2, cost_bbox=5, cost_giou=2)
