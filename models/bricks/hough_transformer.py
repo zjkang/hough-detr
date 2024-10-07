@@ -106,53 +106,53 @@ class HoughPredictor(nn.Module):
         )
         self.init_weights()  # 在__init__的最后调用初始化方法
 
-    def _make_deconv_layer2(self, num_layers, num_filters, num_kernels):
-        assert num_layers == len(num_filters), \
-            'ERROR: num_deconv_layers is different len(num_deconv_filters)'
-        assert num_layers == len(num_kernels), \
-            'ERROR: num_deconv_layers is different len(num_deconv_filters)'
+    # def _make_deconv_layer2(self, num_layers, num_filters, num_kernels):
+    #     assert num_layers == len(num_filters), \
+    #         'ERROR: num_deconv_layers is different len(num_deconv_filters)'
+    #     assert num_layers == len(num_kernels), \
+    #         'ERROR: num_deconv_layers is different len(num_deconv_filters)'
 
-        layers = []
-        for i in range(num_layers):
-            kernel, padding, output_padding = \
-                self._get_deconv_cfg(num_kernels[i], i)
+    #     layers = []
+    #     for i in range(num_layers):
+    #         kernel, padding, output_padding = \
+    #             self._get_deconv_cfg(num_kernels[i], i)
 
-            planes = num_filters[i]
-            fc = nn.Conv2d(self.inplanes, planes,
-                    kernel_size=3, stride=1,
-                    padding=1, dilation=1, bias=False)
-            fill_fc_weights(fc)
-            up = nn.ConvTranspose2d(
-                    in_channels=planes,
-                    out_channels=planes,
-                    kernel_size=kernel,
-                    stride=2,
-                    padding=padding,
-                    output_padding=output_padding,
-                    bias=self.deconv_with_bias)
+    #         planes = num_filters[i]
+    #         fc = nn.Conv2d(self.inplanes, planes,
+    #                 kernel_size=3, stride=1,
+    #                 padding=1, dilation=1, bias=False)
+    #         fill_fc_weights(fc)
+    #         up = nn.ConvTranspose2d(
+    #                 in_channels=planes,
+    #                 out_channels=planes,
+    #                 kernel_size=kernel,
+    #                 stride=2,
+    #                 padding=padding,
+    #                 output_padding=output_padding,
+    #                 bias=self.deconv_with_bias)
 
-            layers.append(fc)
-            layers.append(nn.BatchNorm2d(planes, momentum=BN_MOMENTUM))
-            layers.append(nn.ReLU(inplace=True))
-            layers.append(up)
-            layers.append(nn.BatchNorm2d(planes, momentum=BN_MOMENTUM))
-            layers.append(nn.ReLU(inplace=True))
-            self.inplanes = planes
+    #         layers.append(fc)
+    #         layers.append(nn.BatchNorm2d(planes, momentum=BN_MOMENTUM))
+    #         layers.append(nn.ReLU(inplace=True))
+    #         layers.append(up)
+    #         layers.append(nn.BatchNorm2d(planes, momentum=BN_MOMENTUM))
+    #         layers.append(nn.ReLU(inplace=True))
+    #         self.inplanes = planes
 
-        return nn.Sequential(*layers)
+    #     return nn.Sequential(*layers)
 
-    def _get_deconv_cfg(self, deconv_kernel, index):
-        if deconv_kernel == 4:
-            padding = 1
-            output_padding = 0
-        elif deconv_kernel == 3:
-            padding = 1
-            output_padding = 1
-        elif deconv_kernel == 2:
-            padding = 0
-            output_padding = 0
+    # def _get_deconv_cfg(self, deconv_kernel, index):
+    #     if deconv_kernel == 4:
+    #         padding = 1
+    #         output_padding = 0
+    #     elif deconv_kernel == 3:
+    #         padding = 1
+    #         output_padding = 1
+    #     elif deconv_kernel == 2:
+    #         padding = 0
+    #         output_padding = 0
 
-        return deconv_kernel, padding, output_padding
+    #     return deconv_kernel, padding, output_padding
 
     # x: (b, c=embed_dim, h, w)
     def forward(self, x):
@@ -166,24 +166,28 @@ class HoughPredictor(nn.Module):
         return out
 
     def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                # init to 0
-                nn.init.constant_(m.weight, 0)
-                # nn.init.normal_(m.weight, std=0.001)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.ConvTranspose2d):
-                nn.init.normal_(m.weight, std=0.001)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, std=0.001)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+        nn.init.kaiming_normal_(self.voting_map_hm.weight)
+        nn.init.zeros_(self.voting_map_hm.bias)
+
+    # def init_weights(self):
+    #     for m in self.modules():
+    #         if isinstance(m, nn.Conv2d):
+    #             # init to 0
+    #             nn.init.constant_(m.weight, 0)
+    #             # nn.init.normal_(m.weight, std=0.001)
+    #             if m.bias is not None:
+    #                 nn.init.constant_(m.bias, 0)
+    #         elif isinstance(m, nn.ConvTranspose2d):
+    #             nn.init.normal_(m.weight, std=0.001)
+    #             if m.bias is not None:
+    #                 nn.init.constant_(m.bias, 0)
+    #         elif isinstance(m, nn.BatchNorm2d):
+    #             nn.init.constant_(m.weight, 1)
+    #             nn.init.constant_(m.bias, 0)
+    #         elif isinstance(m, nn.Linear):
+    #             nn.init.normal_(m.weight, std=0.001)
+    #             if m.bias is not None:
+    #                 nn.init.constant_(m.bias, 0)
 
 
 class HoughTransformer(TwostageTransformer):
