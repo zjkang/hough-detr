@@ -1,15 +1,9 @@
-
-import torch
-import torch.nn as nn
-
-import numpy as np
-PI = np.pi
-
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+from typing import Tuple, List
 
 PI = np.pi
 
@@ -68,14 +62,14 @@ class Hough(nn.Module):
 
         return W
 
-    @torch.jit.script
+    # @torch.jit.script
     def generate_grid(self, h: int, w: int):
         x = torch.arange(0, w).float().cuda()
         y = torch.arange(0, h).float().cuda()
         grid = torch.stack([x.repeat(h), y.repeat(w, 1).t().contiguous().view(-1)], 1)
         return grid.repeat(1, 1).view(-1, 2)
 
-    @torch.jit.script
+    # @torch.jit.script
     def calculate_logmap(self, im_size: Tuple[int, int], center: torch.Tensor, angle: int, R2_list: List[int]):
         points = self.grid
         total_angles = 360 // angle
