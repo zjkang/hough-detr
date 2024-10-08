@@ -89,15 +89,16 @@ class HoughPredictor(nn.Module):
         num_output = self.num_classes * self.region_num
         # voting_map_hm: (b, num_classes * region_num, h, w)
         # 109k params
-        # self.voting_map_hm = nn.Sequential(
-        #     nn.Conv2d(self.inplanes, self.head_conv,
-        #         kernel_size=3, padding=1, bias=True),
-        #     nn.ReLU(inplace=True),
-        #     nn.Conv2d(self.head_conv, num_output,
-        #         kernel_size=1, stride=1, padding=0))
         self.voting_map_hm = nn.Sequential(
-            nn.Conv2d(self.inplanes, num_output, kernel_size=1, stride=1, padding=0)
-        )
+            nn.Conv2d(self.inplanes, self.head_conv,
+                kernel_size=3, padding=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.head_conv, num_output,
+                kernel_size=1, stride=1, padding=0))
+        # note: simplified version
+        # self.voting_map_hm = nn.Sequential(
+        #     nn.Conv2d(self.inplanes, num_output, kernel_size=1, stride=1, padding=0)
+        # )
         # voting_hm: (b,num_classes,h,w)
         self.voting_hm = Hough(
             region_num=self.region_num,
