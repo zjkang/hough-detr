@@ -1,26 +1,22 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-
-from typing import Tuple, List
-
-PI = np.pi
-
 
 # shape w/ default settings
+import torch
+from torch import nn
+import torch.nn.functional as F
+from typing import List, Tuple, Optional
+
 class Hough(nn.Module):
     def __init__(
             self,
-            angle=90,
-            R2_list=[4, 64, 256, 1024],
-            num_classes=80,
-            region_num=9,
-            vote_field_size=17,
-            voting_map_size_w=128,
-            voting_map_size_h=128,
-            model_v1=False):
-        # vote_field_size <= min(voting_map_size_w, voting_map_size_h)
+            angle: int = 90,
+            R2_list: List[int] = [4, 64, 256, 1024],
+            num_classes: int = 80,
+            region_num: int = 9,
+            vote_field_size: int = 17,
+            voting_map_size_w: int = 128,
+            voting_map_size_h: int = 128,
+            model_v1: bool = False,
+            chunk_size: int = 32):
         super(Hough, self).__init__()
         self.angle = angle
         self.R2_list = R2_list
@@ -31,15 +27,46 @@ class Hough(nn.Module):
         self.voting_map_size_w = voting_map_size_w
         self.voting_map_size_h = voting_map_size_h
         self.model_v1 = model_v1
+        self.chunk_size = chunk_size
 
         # Precompute and cache
-        self.grid = self.generate_grid(self.voting_map_size_h, self.voting_map_size_w)
-        vote_center = torch.tensor([self.voting_map_size_h // 2, self.voting_map_size_w // 2]).cuda()
-        self.logmap_onehot = self.calculate_logmap((self.voting_map_size_h, self.voting_map_size_w),
-                                                   vote_center, self.angle, self.R2_list)
-        self.deconv_filters = self._prepare_deconv_filters()
+        self.register_buffer('grid', self.generate_grid(self.voting_map_size_h, self.voting_map_size_w))
+        vote_center = torch.tensor([self.voting_map_size_h // 2, self.voting_map_size_w // 2])
+        self.register_buffer('logmap_onehot', self.calculate_logmap((self.voting_map_size_h, self.voting_map_size_w),
+                                                   vote_center, self.angle, self.R2_list))
+        self.register_buffer('deconv_filters', self._prepare_deconv_filters())
 
-    def _prepare_deconv_filters(self):
+    def generate_grid(self, h: int, w: int) -> torch.Tensor:
+        x = torch.arange(0, w).float()
+        y = torch.arange(0, h).float()
+        grid = torch.stack([x.repeat(h), y.repeat(w, 1).t().contiguous().view(-1)], 1)
+        return grid.repeat(1, 1).view(-1, 2)
+
+    def calculate_logmap(self, im_size: Tuple[int, int], center: torch.Tensor, angle: int, R2_list: List[int]) -> torch.Tensor:
+        points = self.grid
+        total_angles = 360 // angle
+
+        y_dif = points[:, 1] - center[0].float()
+        x_dif = points[:, 0] - center[1].float()
+
+        sum_of_squares = x_dif * x_dif + y_dif * y_dif
+
+        arc_angle = (torch.atan2(y_dif, x_dif) * 180 / torch.pi).long()
+        arc_angle[arc_angle < 0] += 360
+        angle_id = (arc_angle // angle).long() + 1
+
+        c_region = torch.ones(sum_of_squares.shape, dtype=torch.long) * len(R2_list)
+        for i in range(len(R2_list) - 1, -1, -1):
+            c_region[sum_of_squares <= R2_list[i]] = i
+
+        results = angle_id + (c_region - 1) * total_angles
+        results[results < 0] = 0
+
+        logmap = results.view(im_size[0], im_size[1])
+        logmap_onehot = F.one_hot(logmap.long(), num_classes=17).float()
+        return logmap_onehot[:, :, :self.region_num]
+
+    def _prepare_deconv_filters(self) -> torch.Tensor:
         weights = self.logmap_onehot / torch.clamp(torch.sum(torch.sum(
             self.logmap_onehot, dim=0), dim=0).float(), min=1.0)
 
@@ -62,47 +89,12 @@ class Hough(nn.Module):
 
         return W
 
-    # @torch.jit.script
-    def generate_grid(self, h: int, w: int):
-        x = torch.arange(0, w).float().cuda()
-        y = torch.arange(0, h).float().cuda()
-        grid = torch.stack([x.repeat(h), y.repeat(w, 1).t().contiguous().view(-1)], 1)
-        return grid.repeat(1, 1).view(-1, 2)
-
-    # @torch.jit.script
-    def calculate_logmap(self, im_size: Tuple[int, int], center: torch.Tensor, angle: int, R2_list: List[int]):
-        points = self.grid
-        total_angles = 360 // angle
-
-        y_dif = points[:, 1] - center[0].float()
-        x_dif = points[:, 0] - center[1].float()
-
-        sum_of_squares = x_dif * x_dif + y_dif * y_dif
-
-        arc_angle = (torch.atan2(y_dif, x_dif) * 180 / PI).long()
-        arc_angle[arc_angle < 0] += 360
-        angle_id = (arc_angle // angle).long() + 1
-
-        c_region = torch.ones(sum_of_squares.shape, dtype=torch.long).cuda() * len(R2_list)
-        for i in range(len(R2_list) - 1, -1, -1):
-            c_region[sum_of_squares <= R2_list[i]] = i
-
-        results = angle_id + (c_region - 1) * total_angles
-        results[results < 0] = 0
-
-        logmap = results.view(im_size[0], im_size[1])
-        logmap_onehot = F.one_hot(logmap.long(), num_classes=17).float()
-        return logmap_onehot[:, :, :self.region_num]
-
-
-    # voting_map: (b,num_classes * region_num, h, w)
-    def forward(self, voting_map, targets=None):
+    def forward(self, voting_map: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
         if self.model_v1:
             batch_size, channels, width, height = voting_map.shape
             voting_map = voting_map.view(batch_size, self.region_num, self.num_classes, width, height)
             voting_map = voting_map.permute(0, 2, 1, 3, 4).reshape(batch_size, -1, width, height)
 
-        # heatmap: (b,num_classes, h, w)
         heatmap = F.conv_transpose2d(
             voting_map,
             self.deconv_filters,
@@ -112,9 +104,26 @@ class Hough(nn.Module):
             groups=self.num_classes
         )
 
+        # # 使用批处理
+        # heatmaps = []
+        # for i in range(0, self.num_classes, self.chunk_size):
+        #     end = min(i + self.chunk_size, self.num_classes)
+        #     chunk = voting_map[:, i*self.region_num:end*self.region_num]
+        #     chunk_filters = self.deconv_filters[i*self.region_num:end*self.region_num]
+            
+        #     chunk_heatmap = F.conv_transpose2d(
+        #         chunk,
+        #         chunk_filters,
+        #         bias=None,
+        #         stride=1,
+        #         padding=self.deconv_filter_padding,
+        #         groups=end-i
+        #     )
+        #     heatmaps.append(chunk_heatmap)
+        # # 合并所有批次的结果
+        # heatmap = torch.cat(heatmaps, dim=1)
+
         return heatmap
-
-
 
 # class Hough(nn.Module):
 

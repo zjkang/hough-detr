@@ -89,6 +89,8 @@ def train_one_epoch_acc(
             logger.info(get_logging_string(metric_logger, data_loader, i, epoch))
             training_logs = {k.replace("loss_", "loss/"): v for k, v in training_logs.items()}
             accelerator.log(training_logs, step=i + len(data_loader) * epoch)
+        
+        # torch.cuda.empty_cache()
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
