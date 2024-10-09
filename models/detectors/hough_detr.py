@@ -4,6 +4,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torchvision.ops import boxes as box_ops
+from collections import defaultdict
 
 from models.bricks.denoising import GenerateCDNQueries
 from models.bricks.losses import sigmoid_focal_loss, weighted_multi_class_focal_loss
@@ -136,6 +137,14 @@ from models.detectors.base_detector import DNDETRDetector
 #         # add noise to add randomness
 #         mask = (1 - self.noise_scale) * mask + self.noise_scale * torch.rand_like(mask)
 #         return mask # confidence score & 0
+
+
+
+
+
+
+
+
 
 
 # NOTE: potential improvement:
@@ -289,6 +298,116 @@ class HoughCriterion(nn.Module):
         return mask
 
 
+    # TODO: plot features points within targets in levels
+import matplotlib.pyplot as plt
+
+def visualize_points_in_targets(points_in_targets, image):
+    plt.figure(figsize=(12, 12))
+    plt.imshow(image)
+
+    for item in points_in_targets:
+        points = item['points']
+        box = item['box']
+        label = item['label']
+        level = item['level']
+        item['']
+        # 绘制点
+        plt.scatter(points[:, 0], points[:, 1], s=1, alpha=0.5)
+        # 绘制边界框
+        rect = plt.Rectangle((box[0], box[1]), box[2]-box[0], box[3]-box[1],
+                             fill=False, edgecolor='r', linewidth=2)
+        plt.gca().add_patch(rect)
+        # 添加标签
+        # plt.text(box[0], box[1], f'Label: {label}', color='r', fontsize=8)
+    plt.axis('off')
+    plt.show()
+
+
+def get_targets_info(feature_maps, targets, feature_strides, image_sizes):
+    # gt_boxes_list: [{boxes, labels}] len() = batch, boxes: the boxes in one image
+    # ground-truth target real coords
+    gt_boxes_list = []
+    for t, (img_h, img_w) in zip(targets, image_sizes):
+        boxes = t["boxes"]
+        labels = t["labels"]
+        boxes = box_ops._box_cxcywh_to_xyxy(boxes)
+        scale_factor = torch.tensor([img_w, img_h, img_w, img_h], device=boxes.device)
+        gt_boxes_list.append(((boxes * scale_factor), labels))
+
+    points_in_targets_map = defaultdict([])
+    for level_idx, (feat_map, feature_stride) in enumerate(zip(feature_maps, feature_strides)):
+        feature_shape = feat_map.shape[-2:]
+        coord_x, coord_y = self.get_pixel_coordinate(
+            feature_shape, feature_stride, device=feat_map.device)
+
+        for img_idx, (gt_boxes, labels) in enumerate(gt_boxes_list):
+            points_per_image = []
+            # (h_i*w_i, m)
+            mask_in_gt_boxes, coord_x, coord_y = self.filter_mask_in_target(coord_x, coord_y, gt_boxes)
+            # 对每个目标框单独处理
+            for box_idx in range(gt_boxes.shape[0]):
+                mask_for_box = mask_in_gt_boxes[:, box_idx]
+                points_in_box_x = coord_x[mask_for_box]
+                points_in_box_y = coord_y[mask_for_box]
+                points_in_box = torch.stack([points_in_box_x, points_in_box_y], dim=1)
+                points_per_image.append({
+                    'points': points_in_box,
+                    'box': gt_boxes[box_idx],
+                    'label': labels[box_idx],
+                    'level': level_idx,
+                    'boxIdx': box_idx,
+                })
+            points_in_targets_map[img_idx].extend(points_per_image)
+
+    return points_in_targets_map
+
+def filter_mask_in_target(coord_x, coord_y, gt_boxes):
+    left_border_distance = coord_x[:, None] - gt_boxes[None, :, 0]  # (h*w, m)
+    top_border_distance = coord_y[:, None] - gt_boxes[None, :, 1]
+    right_border_distance = gt_boxes[None, :, 2] - coord_x[:, None]
+    bottom_border_distance = gt_boxes[None, :, 3] - coord_y[:, None]
+    border_distances = torch.stack(
+        [left_border_distance, top_border_distance, right_border_distance, bottom_border_distance],
+        dim=-1,
+    )  # (h*w, m, 4)
+    min_border_distances = torch.min(border_distances, dim=-1)[0]  # (h*w, m)
+    mask_in_gt_boxes = min_border_distances > 0
+    return mask_in_gt_boxes, coord_x, coord_y
+
+def get_single_image_from_image_list(image_list, index: int):
+    batched_images = image_list.tensors
+    # 获取原始图像尺寸
+    original_size = image_list.image_sizes[index]
+    # 提取单张图像
+    single_image = batched_images[index]
+    # 裁剪到原始尺寸
+    single_image = single_image[:, :original_size[0], :original_size[1]]
+    return single_image
+
+
+def plot_targets(images, targets, multi_level_feats):
+    feature_strides = [(
+        images.tensors.shape[-2] / feature.shape[-2],
+        images.tensors.shape[-1] / feature.shape[-1],
+    ) for feature in multi_level_feats]
+
+    target_map = get_targets_info(
+        multi_level_feats, targets, feature_strides, images.image_sizes)
+
+    img_idx, box_idx, level_idx = 0, 0, -1
+    # plot by targets and levels
+    points_in_target = []
+    for l_tgt in target_map[img_idx]:
+        cur_level = l_tgt['level']
+        cur_box_idx = l_tgt['boxIdx']
+        if (box_idx == -1 or cur_box_idx == box_idx) and \
+            (level_idx == -1 or cur_level == level_idx):
+            points_in_target.append(l_tgt)
+
+    image = get_single_image_from_image_list(images, img_idx)
+    visualize_points_in_targets(points_in_target, image)
+
+
 class HoughDETR(DNDETRDetector):
     def __init__(
         # model structure
@@ -349,6 +468,10 @@ class HoughDETR(DNDETRDetector):
         multi_level_feats = self.backbone(images.tensors)
         # multi_level_feats: [(b, c_i, h_i, w_i)], h_i > h_(i+1) && w_i > w_(i+1)
         multi_level_feats = self.neck(multi_level_feats)
+
+        # plot the targets
+        plot_targets(images, targets, multi_level_feats)
+
 
         # multi_level_masks: [(b, h_i, w_i)], boolean
         multi_level_masks = []

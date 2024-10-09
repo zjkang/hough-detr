@@ -28,6 +28,11 @@ jupyter notebook --no-browser
 How to run
 CUDA_VISIBLE_DEVICES=0 accelerate launch main.py
 
+# specify a checkpoint folder to resume, or a pretrained ".pth" to finetune, for example:
+# checkpoints/salience_detr_resnet50_800_1333/train/2024-03-22-09_38_50
+# checkpoints/salience_detr_resnet50_800_1333/train/2024-03-22-09_38_50/best_ap.pth
+resume_from_checkpoint = checkpoints/salience_detr_resnet50_800_1333/train/
+
 
 ----
 conda env

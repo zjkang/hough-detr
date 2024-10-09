@@ -110,7 +110,6 @@ class Hough(nn.Module):
         #     end = min(i + self.chunk_size, self.num_classes)
         #     chunk = voting_map[:, i*self.region_num:end*self.region_num]
         #     chunk_filters = self.deconv_filters[i*self.region_num:end*self.region_num]
-            
         #     chunk_heatmap = F.conv_transpose2d(
         #         chunk,
         #         chunk_filters,
@@ -125,6 +124,8 @@ class Hough(nn.Module):
 
         return heatmap
 
+
+# ------------------------
 # class Hough(nn.Module):
 
 #     def __init__(
