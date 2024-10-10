@@ -141,187 +141,366 @@ from models.detectors.base_detector import DNDETRDetector
 
 
 
-
-
-
-
-
-
 # NOTE: potential improvement:
 # 1. heat map design
 #    (1): distance -> confidence (x)
 #    (2): gaussian conv
 # 2. loss function
-#    (1) focal loss with positive / negative (x)
+#    (1) focal loss with positive / negative (x): 
 #    (2) focal loss with weights
 #    (3) cornernet: only center or few points as positive, negative with weights
 # 3. Do I need to select tokens (pixels) in multi-scales
 #       high resolution (small object); low (large object)
+
+import torch
+import torch.nn as nn
+import numpy as np
+
+# v2: project targets [{'boxes', 'labels'}] to heat_maps [[(b, num_classes, h_i, w_i)]]
 class HoughCriterion(nn.Module):
-    def __init__(
-        self,
-        limit_range: Tuple = ((-1, 64), (64, 128), (128, 256), (256, 99999)),
-        noise_scale: float = 0.0,
-        alpha: float = 0.25,
-        gamma: float = 2.0,
-        num_classes: int = 91
-    ):
+    def __init__(self, alpha=2, beta=4):
         super().__init__()
-        self.limit_range = limit_range
-        self.noise_scale = noise_scale
         self.alpha = alpha
-        self.gamma = gamma
-        self.num_classes = num_classes
+        self.beta = beta
+
+    @staticmethod
+    def gaussian2D(shape, sigma=1):
+        m, n = [(ss - 1.) / 2. for ss in shape]
+        y, x = np.ogrid[-m:m+1, -n:n+1]
+        h = np.exp(-(x * x + y * y) / (2 * sigma * sigma))
+        h[h < np.finfo(h.dtype).eps * h.max()] = 0
+        h = h / h.max()  # 归一化，确保最大值为 1
+        return torch.from_numpy(h).float()
+
+    def draw_gaussian(self, heatmap, center, radius):
+        diameter = 2 * radius + 1
+        gaussian = self.gaussian2D((diameter, diameter), sigma=diameter / 6)
+        
+        x, y = int(center[0]), int(center[1])
+        height, width = heatmap.shape[-2:]
+        
+        left, right = min(x, radius), min(width - x, radius + 1)
+        top, bottom = min(y, radius), min(height - y, radius + 1)
+
+        masked_heatmap = heatmap[..., y - top:y + bottom, x - left:x + right]
+        masked_gaussian = gaussian[radius - top:radius + bottom, radius - left:radius + right]
+
+        if min(masked_gaussian.shape) > 0 and min(masked_heatmap.shape) > 0:
+            torch.max(masked_heatmap, masked_gaussian.to(heatmap.device), out=masked_heatmap)
+        return heatmap
 
     def forward(self, heat_maps, targets, feature_strides, image_sizes):
-        # heat_maps(foreground_mask): [(b, num_classes, h_i, w_i)]
-        # gt_boxes_list: [{boxes, labels}] len() = batch, boxes: the boxes in one image
-        # ground-truth target real coords
-        gt_boxes_list = []
-        for t, (img_h, img_w) in zip(targets, image_sizes):
-            boxes = t["boxes"]
-            labels = t["labels"]
-            boxes = box_ops._box_cxcywh_to_xyxy(boxes)
-            scale_factor = torch.tensor([img_w, img_h, img_w, img_h], device=boxes.device)
-            gt_boxes_list.append(((boxes * scale_factor), labels))
+        batch_size = len(targets)
+        device = heat_maps[0].device
+        
+        target_maps = []
+        for level, (heat_map, stride) in enumerate(zip(heat_maps, feature_strides)):
+            h, w = heat_map.shape[-2:]
+            target_map = torch.zeros_like(heat_map)
+            for b in range(batch_size):
+                # 获取原始图像尺寸
+                orig_h, orig_w = image_sizes[b]
+                # 计算缩放因子
+                scale_x = w / orig_w
+                scale_y = h / orig_h
+                
+                for box, label in zip(targets[b]['boxes'], targets[b]['labels']):
+                    # 将归一化的坐标转换回原始图像尺寸，然后应用缩放
+                    cx, cy, bw, bh = box * torch.tensor([orig_w, orig_h, orig_w, orig_h], device=device)
+                    cx = cx * scale_x
+                    cy = cy * scale_y
+                    bw = bw * scale_x
+                    bh = bh * scale_y
+                    
+                    ct = torch.tensor([cx, cy], device=device)
+                    ct_int = ct.long()
+                    
+                    radius = max(1, int(((bw + bh) / 2) / 2))
+                    self.draw_gaussian(target_map[b, label], ct_int, radius)
+            target_maps.append(target_map)
+        
+        # 将所有层级的热图和目标图拼接
+        heat_maps = torch.cat([m.flatten(2) for m in heat_maps], dim=2)
+        target_maps = torch.cat([m.flatten(2) for m in target_maps], dim=2)
+        
+        # 计算 Focal Loss
+        pos_inds = target_maps.eq(1).float()
+        neg_inds = target_maps.lt(1).float()
+        
+        neg_weights = torch.pow(1 - target_maps, self.beta)
+        
+        heat_maps = torch.clamp(heat_maps.sigmoid_(), min=1e-4, max=1-1e-4)
+        pos_loss = torch.log(heat_maps) * torch.pow(1 - heat_maps, self.alpha) * pos_inds
+        neg_loss = torch.log(1 - heat_maps) * torch.pow(heat_maps, self.alpha) * neg_weights * neg_inds
 
-        mask_targets = []
-        for level_idx, (heat_map, feature_stride) in enumerate(zip(heat_maps, feature_strides)):
-            feature_shape = heat_map.shape[-2:]
-            coord_x, coord_y = self.get_pixel_coordinate(
-                feature_shape, feature_stride, device=heat_map.device)
-            masks_per_level = []
-            for gt_boxes, labels in gt_boxes_list:
-                # mask: (h_i * w_i, num_classes)
-                mask = self.get_mask_single_level(coord_x, coord_y, gt_boxes, labels, level_idx)
-                masks_per_level.append(mask)
-            # (masks_per_level: (batch_size, h_i * w_i, num_classes)
-            masks_per_level = torch.stack(masks_per_level)
-            # masks_per_level: (batch_size, num_classes, h_i * w_i)
-            masks_per_level = masks_per_level.permute(0, 2, 1)
-            mask_targets.append(masks_per_level)
-        # mask_targets: (batch_size, num_classes, sum(h_i * w_i))
-        mask_targets = torch.cat(mask_targets, dim=2)
+        num_pos = pos_inds.sum(dim=2, keepdim=True)
+        pos_loss = pos_loss.sum(dim=2, keepdim=True)
+        neg_loss = neg_loss.sum(dim=2, keepdim=True)
 
-        # heat_maps: (batch_size, num_classes, sum(h_i * w_i))
-        heat_maps = torch.cat([e.flatten(-2) for e in heat_maps], -1)
-        # num_pos: (batch_size, num_classes)
-        num_pos = torch.sum(mask_targets > 0.5 * self.noise_scale, dim=2).clamp_(min=1)
-        heat_map_loss = (
-            weighted_multi_class_focal_loss(
-                heat_maps,
-                mask_targets,
-                num_pos,
-                alpha=self.alpha,
-                gamma=self.gamma,
-            )
-            # weighted_multi_class_focal_loss(
-            #     heat_maps,
-            #     mask_targets,
-            #     num_pos,
-            #     alpha=self.alpha,
-            #     gamma=self.gamma,
-            # ) * heat_maps.shape[2]
-        )
-        return {"loss_hough": heat_map_loss}
+        loss = torch.where(num_pos == 0, -neg_loss, -(pos_loss + neg_loss) / num_pos)
+        loss = torch.clamp(loss, max=10)
+        
+        # 梯度裁剪
+        # loss = torch.where(num_pos == 0, -neg_loss, -(pos_loss + neg_loss) / num_pos)
+        # loss = torch.clamp(loss, max=10)  # 限制最大损失值
+        # return {"loss_hough": loss.mean()}
 
-    def get_pixel_coordinate(self, feature_shape, stride, device):
-        height, width = feature_shape
-        coord_y, coord_x = torch.meshgrid(
-            torch.linspace(0.5, height - 0.5, height, dtype=torch.float32, device=device) * stride[0],
-            torch.linspace(0.5, width - 0.5, width, dtype=torch.float32, device=device) * stride[1],
-            indexing="ij",
-        )
-        coord_y = coord_y.reshape(-1)
-        coord_x = coord_x.reshape(-1)
-        return coord_x, coord_y
-
-    def get_mask_single_level(self, coord_x, coord_y, gt_boxes, labels, level_idx):
-        # TODO: alternative gaussian to calculate point confidence
-        # labels: (m,) gt_boxes: (m, 4)
-        # coord_x: (h*w, )
-        left_border_distance = coord_x[:, None] - gt_boxes[None, :, 0]  # (h*w, m)
-        top_border_distance = coord_y[:, None] - gt_boxes[None, :, 1]
-        right_border_distance = gt_boxes[None, :, 2] - coord_x[:, None]
-        bottom_border_distance = gt_boxes[None, :, 3] - coord_y[:, None]
-        border_distances = torch.stack(
-            [left_border_distance, top_border_distance, right_border_distance, bottom_border_distance],
-            dim=-1,
-        )  # [h*w, m, 4]
-
-        # the foreground queries must satisfy two requirements:
-        # 1. the quereis located in bounding boxes
-        # 2. the distance from queries to the box center match the feature map stride
-        min_border_distances = torch.min(border_distances, dim=-1)[0]  # [h*w, m]
-        max_border_distances = torch.max(border_distances, dim=-1)[0]
-        mask_in_gt_boxes = min_border_distances > 0
-        min_limit, max_limit = self.limit_range[level_idx]
-        mask_in_level = (max_border_distances > min_limit) & (max_border_distances <= max_limit)
-        mask_pos = mask_in_gt_boxes & mask_in_level
-
-        # scale-independent salience confidence
-        row_factor = left_border_distance + right_border_distance
-        col_factor = top_border_distance + bottom_border_distance
-        # delta_x, delta_y, range [-1,1]
-        delta_x = (left_border_distance - right_border_distance) / row_factor
-        delta_y = (top_border_distance - bottom_border_distance) / col_factor
-        # confidence range [0, 0.707], related the relative dist from point to boundary rather than absolute dist
-        confidence = torch.sqrt(delta_x**2 + delta_y**2) / 2
-
-        # confidence_per_box: (h * w, m), m is # of boxes
-        confidence_per_box = 1 - confidence
-        confidence_per_box[~mask_in_gt_boxes] = 0
-
-        # 创建一个包含所有类别的掩码
-        mask = torch.zeros((coord_y.shape[0], self.num_classes), device=confidence.device, dtype=confidence.dtype)
-
-        # 为每个类别分别处理
-        for class_id in range(self.num_classes):
-            class_mask = labels == class_id # [T,F,...T,F]
-            if class_mask.sum() > 0:
-                class_confidence = confidence_per_box[:, class_mask]
-                class_mask_pos = mask_pos[:, class_mask]
-
-                if class_confidence.numel() != 0:
-                    class_mask_values = class_confidence.max(-1)[0]
-                else:
-                    class_mask_values = torch.zeros(coord_y.shape, device=confidence.device, dtype=confidence.dtype)
-
-                class_mask_pos = class_mask_pos.long().sum(dim=-1) >= 1
-                class_mask_values[~class_mask_pos] = 0
-
-                mask[:, class_id] = class_mask_values
-
-        # add noise to add randomness
-        # mask: (h_i * w_i, num_classes)
-        mask = (1 - self.noise_scale) * mask + self.noise_scale * torch.rand_like(mask)
-        return mask
+        loss_hough = torch.log1p(loss.mean()) / (1 + torch.log1p(loss.mean()))
+        return {"loss_hough": loss_hough}
 
 
-    # TODO: plot features points within targets in levels
+# v1: project heat_maps [(b, num_classes, h_i, w_i)] to targets [{}] original dimension
+# loss is calculated based on the shape of heat_map, true label is assigned based on the distance to the center of the target
+# def cal_multi_class_focal_loss(mask_targets, heat_maps, noise_scale, alpha, gamma):
+#     # num_pos: (batch_size, num_classes)
+#     num_pos = torch.sum(mask_targets > 0.5 * noise_scale, dim=2).clamp_(min=1)
+#     hough_loss = (
+#         weighted_multi_class_focal_loss(
+#             heat_maps,
+#             mask_targets,
+#             num_pos,
+#             alpha=alpha,
+#             gamma=gamma,
+#         )
+#         # weighted_multi_class_focal_loss(
+#         #     heat_maps,
+#         #     mask_targets,
+#         #     num_pos,
+#         #     alpha=self.alpha,
+#         #     gamma=self.gamma,
+#         # ) * heat_maps.shape[2]
+#     )
+#     return hough_loss
+
+# class HoughCriterion(nn.Module):
+#     def __init__(
+#         self,
+#         limit_range: Tuple = ((-1, 64), (64, 128), (128, 256), (256, 99999)),
+#         noise_scale: float = 0.0,
+#         alpha: float = 0.25,
+#         gamma: float = 2.0,
+#         num_classes: int = 91
+#     ):
+#         super().__init__()
+#         self.limit_range = limit_range
+#         self.noise_scale = noise_scale
+#         self.alpha = alpha
+#         self.gamma = gamma
+#         self.num_classes = num_classes
+
+#     def forward(self, heat_maps, targets, feature_strides, image_sizes):
+#         # heat_maps(foreground_mask): [(b, num_classes, h_i, w_i)]
+#         # gt_boxes_list: [{boxes, labels}] len() = batch, boxes: the boxes in one image
+#         # ground-truth target real coords
+#         gt_boxes_list = []
+#         for t, (img_h, img_w) in zip(targets, image_sizes):
+#             boxes = t["boxes"]
+#             labels = t["labels"]
+#             boxes = box_ops._box_cxcywh_to_xyxy(boxes)
+#             scale_factor = torch.tensor([img_w, img_h, img_w, img_h], device=boxes.device)
+#             gt_boxes_list.append(((boxes * scale_factor), labels))
+
+#         mask_targets = []
+#         for level_idx, (heat_map, feature_stride) in enumerate(zip(heat_maps, feature_strides)):
+#             feature_shape = heat_map.shape[-2:]
+#             coord_x, coord_y = self.get_pixel_coordinate(
+#                 feature_shape, feature_stride, device=heat_map.device)
+#             masks_per_level = []
+#             for gt_boxes, labels in gt_boxes_list:
+#                 # mask: (h_i * w_i, num_classes)
+#                 mask = self.get_mask_single_level(coord_x, coord_y, gt_boxes, labels, level_idx)
+#                 masks_per_level.append(mask)
+#             # (masks_per_level: (batch_size, h_i * w_i, num_classes)
+#             masks_per_level = torch.stack(masks_per_level)
+#             # masks_per_level: (batch_size, num_classes, h_i * w_i)
+#             masks_per_level = masks_per_level.permute(0, 2, 1)
+#             mask_targets.append(masks_per_level)
+#         # mask_targets: (batch_size, num_classes, sum(h_i * w_i))
+#         mask_targets = torch.cat(mask_targets, dim=2)
+
+#         # heat_maps: (batch_size, num_classes, sum(h_i * w_i))
+#         heat_maps = torch.cat([e.flatten(-2) for e in heat_maps], -1)
+
+#         # multi-class focal loss
+#         loss_hough = cal_multi_class_focal_loss(
+#             mask_targets, heat_maps, self.noise_scale, self.alpha, self.gamma)
+
+#         return {"loss_hough": loss_hough}
+
+#     def get_pixel_coordinate(self, feature_shape, stride, device):
+#         height, width = feature_shape
+#         coord_y, coord_x = torch.meshgrid(
+#             torch.linspace(0.5, height - 0.5, height, dtype=torch.float32, device=device) * stride[0],
+#             torch.linspace(0.5, width - 0.5, width, dtype=torch.float32, device=device) * stride[1],
+#             indexing="ij",
+#         )
+#         coord_y = coord_y.reshape(-1)
+#         coord_x = coord_x.reshape(-1)
+#         return coord_x, coord_y
+
+#     def get_mask_single_level(self, coord_x, coord_y, gt_boxes, labels, level_idx):
+#         # TODO: alternative gaussian to calculate point confidence
+#         # labels: (m,) gt_boxes: (m, 4)
+#         # coord_x: (h*w, )
+#         left_border_distance = coord_x[:, None] - gt_boxes[None, :, 0]  # (h*w, m)
+#         top_border_distance = coord_y[:, None] - gt_boxes[None, :, 1]
+#         right_border_distance = gt_boxes[None, :, 2] - coord_x[:, None]
+#         bottom_border_distance = gt_boxes[None, :, 3] - coord_y[:, None]
+#         border_distances = torch.stack(
+#             [left_border_distance, top_border_distance, right_border_distance, bottom_border_distance],
+#             dim=-1,
+#         )  # [h*w, m, 4]
+
+#         # the foreground queries must satisfy two requirements:
+#         # 1. the quereis located in bounding boxes
+#         # 2. the distance from queries to the box center match the feature map stride
+#         min_border_distances = torch.min(border_distances, dim=-1)[0]  # [h*w, m]
+#         max_border_distances = torch.max(border_distances, dim=-1)[0]
+#         mask_in_gt_boxes = min_border_distances > 0
+#         min_limit, max_limit = self.limit_range[level_idx]
+#         mask_in_level = (max_border_distances > min_limit) & (max_border_distances <= max_limit)
+#         mask_pos = mask_in_gt_boxes & mask_in_level
+
+#         # scale-independent salience confidence
+#         row_factor = left_border_distance + right_border_distance
+#         col_factor = top_border_distance + bottom_border_distance
+#         # delta_x, delta_y, range [-1,1]
+#         delta_x = (left_border_distance - right_border_distance) / row_factor
+#         delta_y = (top_border_distance - bottom_border_distance) / col_factor
+#         # confidence range [0, 0.707], related the relative dist from point to boundary rather than absolute dist
+#         confidence = torch.sqrt(delta_x**2 + delta_y**2) / 2
+
+#         # confidence_per_box: (h * w, m), m is # of boxes
+#         confidence_per_box = 1 - confidence
+#         confidence_per_box[~mask_in_gt_boxes] = 0
+
+#         # 创建一个包含所有类别的掩码
+#         mask = torch.zeros((coord_y.shape[0], self.num_classes), device=confidence.device, dtype=confidence.dtype)
+
+#         # 为每个类别分别处理
+#         for class_id in range(self.num_classes):
+#             class_mask = labels == class_id # [T,F,...T,F]
+#             if class_mask.sum() > 0:
+#                 class_confidence = confidence_per_box[:, class_mask]
+#                 class_mask_pos = mask_pos[:, class_mask]
+
+#                 if class_confidence.numel() != 0:
+#                     class_mask_values = class_confidence.max(-1)[0]
+#                 else:
+#                     class_mask_values = torch.zeros(coord_y.shape, device=confidence.device, dtype=confidence.dtype)
+
+#                 class_mask_pos = class_mask_pos.long().sum(dim=-1) >= 1
+#                 class_mask_values[~class_mask_pos] = 0
+
+#                 mask[:, class_id] = class_mask_values
+
+#         # add noise to add randomness
+#         # mask: (h_i * w_i, num_classes)
+#         mask = (1 - self.noise_scale) * mask + self.noise_scale * torch.rand_like(mask)
+#         return mask
+
+
+
+# TODO: plot features points within targets in levels
+import torch
 import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+
+from torchvision.transforms.functional import to_pil_image
+from torchvision.utils import draw_bounding_boxes
+
+import random
+import string
+
+def get_size(level):
+    base_size = 2
+    return base_size * (level + 2)
+
+def denormalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
+    image = image.clone()  # 创建副本以避免修改原始数据
+    for t, m, s in zip(image, mean, std):
+        t.mul_(s).add_(m)  # 反标准化
+    return image
+
+def tensor_to_pil(image_tensor):
+    image = denormalize(image_tensor)
+    image = image.mul(255).clamp(0, 255).byte()  # 转换到 0-255 范围
+    image = image.cpu().permute(1, 2, 0).numpy()
+    return Image.fromarray(image)
 
 def visualize_points_in_targets(points_in_targets, image):
     plt.figure(figsize=(12, 12))
-    plt.imshow(image)
-
+    
+    # Convert image tensor to PIL Image
+    image_pil = tensor_to_pil(image)
+    
+    # Create a new tensor for drawing bounding boxes
+    draw_image = torch.tensor(np.array(image_pil)).permute(2, 0, 1)
+    
+    boxes = []
+    labels = []
+    colors = []
+    
     for item in points_in_targets:
-        points = item['points']
-        box = item['box']
-        label = item['label']
+        points = item['points'].cpu().numpy()
+        box = item['box'].cpu()
+        label = item['label'].item()
         level = item['level']
-        item['']
-        # 绘制点
-        plt.scatter(points[:, 0], points[:, 1], s=1, alpha=0.5)
-        # 绘制边界框
-        rect = plt.Rectangle((box[0], box[1]), box[2]-box[0], box[3]-box[1],
-                             fill=False, edgecolor='r', linewidth=2)
-        plt.gca().add_patch(rect)
-        # 添加标签
-        # plt.text(box[0], box[1], f'Label: {label}', color='r', fontsize=8)
-    plt.axis('off')
-    plt.show()
+        size = get_size(level)
+        
+        # Plot points
+        plt.scatter(points[:, 0], points[:, 1], s=size, alpha=0.5)
+        
+        # Prepare box and label for drawing
+        boxes.append(box)
+        labels.append(f"Label: {label}, Level: {level}")
+        colors.append("red")
 
+    # Draw all bounding boxes at once
+    draw_image = draw_bounding_boxes(draw_image, torch.stack(boxes), labels, colors, width=2)
+    
+    # Convert back to PIL and display
+    plt.imshow(to_pil_image(draw_image))
+    plt.axis('off')
+    letters = string.ascii_lowercase
+    random_str = ''.join(random.choice(letters) for i in range(4))
+    filename = f'visualization_{random_str}.png'
+    plt.savefig(filename)
+    plt.close()
+    # plt.show()
+
+# def visualize_points_in_targets(points_in_targets, image):
+#     plt.figure(figsize=(12, 12))
+#     plt.imshow(image)
+
+#     for item in points_in_targets:
+#         points = item['points']
+#         box = item['box']
+#         label = item['label']
+#         level = item['level']
+#         item['']
+#         # 绘制点
+#         plt.scatter(points[:, 0], points[:, 1], s=1, alpha=0.5)
+#         # 绘制边界框
+#         rect = plt.Rectangle((box[0], box[1]), box[2]-box[0], box[3]-box[1],
+#                              fill=False, edgecolor='r', linewidth=2)
+#         plt.gca().add_patch(rect)
+#         # 添加标签
+#         # plt.text(box[0], box[1], f'Label: {label}', color='r', fontsize=8)
+#     plt.axis('off')
+#     plt.show()
+
+def get_pixel_coordinate(feature_shape, stride, device):
+    height, width = feature_shape
+    coord_y, coord_x = torch.meshgrid(
+        torch.linspace(0.5, height - 0.5, height, dtype=torch.float32, device=device) * stride[0],
+        torch.linspace(0.5, width - 0.5, width, dtype=torch.float32, device=device) * stride[1],
+        indexing="ij",
+    )
+    coord_y = coord_y.reshape(-1)
+    coord_x = coord_x.reshape(-1)
+    return coord_x, coord_y
 
 def get_targets_info(feature_maps, targets, feature_strides, image_sizes):
     # gt_boxes_list: [{boxes, labels}] len() = batch, boxes: the boxes in one image
@@ -334,16 +513,16 @@ def get_targets_info(feature_maps, targets, feature_strides, image_sizes):
         scale_factor = torch.tensor([img_w, img_h, img_w, img_h], device=boxes.device)
         gt_boxes_list.append(((boxes * scale_factor), labels))
 
-    points_in_targets_map = defaultdict([])
+    points_in_targets_map = defaultdict(list)
     for level_idx, (feat_map, feature_stride) in enumerate(zip(feature_maps, feature_strides)):
         feature_shape = feat_map.shape[-2:]
-        coord_x, coord_y = self.get_pixel_coordinate(
+        coord_x, coord_y = get_pixel_coordinate(
             feature_shape, feature_stride, device=feat_map.device)
 
         for img_idx, (gt_boxes, labels) in enumerate(gt_boxes_list):
             points_per_image = []
             # (h_i*w_i, m)
-            mask_in_gt_boxes, coord_x, coord_y = self.filter_mask_in_target(coord_x, coord_y, gt_boxes)
+            mask_in_gt_boxes, coord_x, coord_y = filter_mask_in_target(coord_x, coord_y, gt_boxes)
             # 对每个目标框单独处理
             for box_idx in range(gt_boxes.shape[0]):
                 mask_for_box = mask_in_gt_boxes[:, box_idx]
@@ -384,28 +563,31 @@ def get_single_image_from_image_list(image_list, index: int):
     single_image = single_image[:, :original_size[0], :original_size[1]]
     return single_image
 
-
 def plot_targets(images, targets, multi_level_feats):
     feature_strides = [(
-        images.tensors.shape[-2] / feature.shape[-2],
-        images.tensors.shape[-1] / feature.shape[-1],
+        images.tensors.shape[-2] // feature.shape[-2],
+        images.tensors.shape[-1] // feature.shape[-1],
     ) for feature in multi_level_feats]
 
     target_map = get_targets_info(
         multi_level_feats, targets, feature_strides, images.image_sizes)
 
-    img_idx, box_idx, level_idx = 0, 0, -1
-    # plot by targets and levels
-    points_in_target = []
-    for l_tgt in target_map[img_idx]:
-        cur_level = l_tgt['level']
-        cur_box_idx = l_tgt['boxIdx']
-        if (box_idx == -1 or cur_box_idx == box_idx) and \
-            (level_idx == -1 or cur_level == level_idx):
-            points_in_target.append(l_tgt)
+    for img_idx in range(len(images.image_sizes)):
+        box_idx, level_idx = -1, -1
+        # plot by targets and levels
+        points_in_target = []
+        for l_tgt in target_map[img_idx]:
+            cur_level = l_tgt['level']
+            cur_box_idx = l_tgt['boxIdx']
+            if (box_idx == -1 or cur_box_idx == box_idx) and \
+                (level_idx == -1 or cur_level == level_idx):
+                points_in_target.append(l_tgt)
 
-    image = get_single_image_from_image_list(images, img_idx)
-    visualize_points_in_targets(points_in_target, image)
+        image = get_single_image_from_image_list(images, img_idx)
+        visualize_points_in_targets(points_in_target, image)
+    print("Visualization saved as 'visualization.png'")
+
+
 
 
 class HoughDETR(DNDETRDetector):
@@ -470,8 +652,7 @@ class HoughDETR(DNDETRDetector):
         multi_level_feats = self.neck(multi_level_feats)
 
         # plot the targets
-        plot_targets(images, targets, multi_level_feats)
-
+        # plot_targets(images, targets, multi_level_feats)
 
         # multi_level_masks: [(b, h_i, w_i)], boolean
         multi_level_masks = []

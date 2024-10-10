@@ -65,8 +65,17 @@ class HungarianMatcher(nn.Module):
         cost_bbox = self.calculate_bbox_cost(pred_boxes, gt_boxes)
         cost_giou = self.calculate_giou_cost(pred_boxes, gt_boxes)
 
+        # Check for invalid values in individual costs
+        # print(f"Invalid values in cost_class: {torch.isnan(cost_class).sum().item() + torch.isinf(cost_class).sum().item()}")
+        # print(f"Invalid values in cost_bbox: {torch.isnan(cost_bbox).sum().item() + torch.isinf(cost_bbox).sum().item()}")
+        # print(f"Invalid values in cost_giou: {torch.isnan(cost_giou).sum().item() + torch.isinf(cost_giou).sum().item()}")
+
         # Final cost matrix
         c = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+        
+        # Check for invalid values in final cost matrix
+        # print(f"Invalid values in final cost matrix: {torch.isnan(c).sum().item() + torch.isinf(c).sum().item()}")
+        
         return c
 
     @torch.no_grad()
@@ -74,11 +83,31 @@ class HungarianMatcher(nn.Module):
         self, pred_boxes: Tensor, pred_logits: Tensor, gt_boxes: Tensor, gt_labels: Tensor, gt_copy: int = 1
     ):
         c = self.calculate_cost(pred_boxes, pred_logits, gt_boxes, gt_labels)
+        
+        # Check for invalid values and replace them
+        c_cpu = c.cpu()
+        # invalid_count = torch.isnan(c_cpu).sum().item() + torch.isinf(c_cpu).sum().item()
+        # print(f"Invalid values before replacement: {invalid_count}")
+        c_cpu[~torch.isfinite(c_cpu)] = 1e9 
+
+        # invalid_count_after = torch.isnan(c_cpu).sum().item() + torch.isinf(c_cpu).sum().item()
+        # print(f"Invalid values after replacement: {invalid_count_after}")
+
 
         # single assignment
         if not self.mixed_match:
-            indices = linear_sum_assignment(c.cpu())
-            return torch.as_tensor(indices[0]), torch.as_tensor(indices[1])
+            try:
+                indices = linear_sum_assignment(c_cpu)
+                return torch.as_tensor(indices[0]), torch.as_tensor(indices[1])
+            except ValueError as e:
+                print(f"Error in linear_sum_assignment: {e}")
+                print(f"Shape of c_cpu: {c_cpu.shape}")
+                print(f"Min value in c_cpu: {c_cpu.min().item()}")
+                print(f"Max value in c_cpu: {c_cpu.max().item()}")
+                raise
+        # if not self.mixed_match:
+        #     indices = linear_sum_assignment(c.cpu())
+        #     return torch.as_tensor(indices[0]), torch.as_tensor(indices[1])
 
         # mixed assignment, used in AlignDETR
         gt_size = c.size(-1)

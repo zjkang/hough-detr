@@ -98,7 +98,11 @@ weight_dict.update({"loss_class_enc": 1, "loss_bbox_enc": 5, "loss_giou_enc": 2}
 weight_dict.update({"loss_hough": 2})
 
 criterion = HybridSetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict, alpha=0.25, gamma=2.0)
-hough_criterion = HoughCriterion(noise_scale=0.0, alpha=0.25, gamma=2.0)
+# v1
+# hough_criterion = HoughCriterion(noise_scale=0.0, alpha=0.25, gamma=2.0)
+# v2
+hough_criterion = HoughCriterion()
+
 postprocessor = PostProcess(select_box_nums_for_evaluation=300)
 
 # combine above components to instantiate the model

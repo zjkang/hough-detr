@@ -92,9 +92,12 @@ class HoughPredictor(nn.Module):
         self.voting_map_hm = nn.Sequential(
             nn.Conv2d(self.inplanes, self.head_conv,
                 kernel_size=3, padding=1, bias=True),
+            nn.BatchNorm2d(self.head_conv, momentum=BN_MOMENTUM),
             nn.ReLU(inplace=True),
             nn.Conv2d(self.head_conv, num_output,
-                kernel_size=1, stride=1, padding=0))
+                kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(num_output, momentum=BN_MOMENTUM),
+            nn.ReLU(inplace=True))
         # note: simplified version
         # self.voting_map_hm = nn.Sequential(
         #     nn.Conv2d(self.inplanes, num_output, kernel_size=1, stride=1, padding=0)
@@ -167,28 +170,24 @@ class HoughPredictor(nn.Module):
         return out
 
     def init_weights(self):
-        nn.init.kaiming_normal_(self.voting_map_hm.weight)
-        nn.init.zeros_(self.voting_map_hm.bias)
-
-    # def init_weights(self):
-    #     for m in self.modules():
-    #         if isinstance(m, nn.Conv2d):
-    #             # init to 0
-    #             nn.init.constant_(m.weight, 0)
-    #             # nn.init.normal_(m.weight, std=0.001)
-    #             if m.bias is not None:
-    #                 nn.init.constant_(m.bias, 0)
-    #         elif isinstance(m, nn.ConvTranspose2d):
-    #             nn.init.normal_(m.weight, std=0.001)
-    #             if m.bias is not None:
-    #                 nn.init.constant_(m.bias, 0)
-    #         elif isinstance(m, nn.BatchNorm2d):
-    #             nn.init.constant_(m.weight, 1)
-    #             nn.init.constant_(m.bias, 0)
-    #         elif isinstance(m, nn.Linear):
-    #             nn.init.normal_(m.weight, std=0.001)
-    #             if m.bias is not None:
-    #                 nn.init.constant_(m.bias, 0)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # init to 0
+                nn.init.constant_(m.weight, 0)
+                # nn.init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.ConvTranspose2d):
+                nn.init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.001)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
 
 class HoughTransformer(TwostageTransformer):

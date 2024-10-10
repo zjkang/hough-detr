@@ -37,7 +37,7 @@ resume_from_checkpoint = checkpoints/salience_detr_resnet50_800_1333/train/
 ----
 conda env
 conda env list
-conda detr activate
+conda activate detr 
 
 
 ----

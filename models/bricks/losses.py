@@ -1,7 +1,7 @@
 import torch
 from torch.nn import functional as F
 
-# inputs, targets: (b, num_classes)
+# inputs, targets: (b, c): c=num_classes or h*w
 def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
     prob = inputs.sigmoid()
     target_score = targets.to(inputs.dtype)
