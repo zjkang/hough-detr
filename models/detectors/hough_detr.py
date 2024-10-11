@@ -238,7 +238,8 @@ class HoughCriterion(nn.Module):
         neg_loss = neg_loss.sum(dim=2, keepdim=True)
 
         loss = torch.where(num_pos == 0, -neg_loss, -(pos_loss + neg_loss) / num_pos)
-        loss = torch.clamp(loss, max=10)
+        # print(f'hough loss w/ normalization {loss.mean()}')
+        # loss = torch.clamp(loss, max=10)
         
         # 梯度裁剪
         # loss = torch.where(num_pos == 0, -neg_loss, -(pos_loss + neg_loss) / num_pos)
