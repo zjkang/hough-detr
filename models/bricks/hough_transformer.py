@@ -903,6 +903,7 @@ class HoughTransformerDecoder(nn.Module):
 
         # decoder layers and embedding
         self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
+        # generate positional encodings for the reference points in each decoder layer
         self.ref_point_head = MLP(2 * self.embed_dim, self.embed_dim, self.embed_dim, 2)
 
         # iterative bounding box refinement
