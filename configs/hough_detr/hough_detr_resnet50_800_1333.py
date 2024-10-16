@@ -5,7 +5,7 @@ from models.backbones.resnet import ResNetBackbone
 from models.bricks.misc import FrozenBatchNorm2d
 from models.bricks.position_encoding import PositionEmbeddingSine
 from models.bricks.post_process import PostProcess
-from models.bricks.hough_transformer import (
+from models.bricks.hough_transformer_v2 import (
     HoughTransformer,
     HoughTransformerDecoder,
     HoughTransformerDecoderLayer,
@@ -13,7 +13,7 @@ from models.bricks.hough_transformer import (
     HoughTransformerEncoderLayer,
 )
 from models.bricks.set_criterion import HybridSetCriterion
-from models.detectors.hough_detr import HoughCriterion, HoughDETR
+from models.detectors.hough_detr import HoughCriterion, HoughDETR, SalienceCriterion
 from models.matcher.hungarian_matcher import HungarianMatcher
 from models.necks.channel_mapper import ChannelMapper
 from models.necks.repnet import RepVGGPluXNetwork
@@ -91,11 +91,12 @@ weight_dict.update({
     for k, v in weight_dict.items()
 })
 weight_dict.update({"loss_class_enc": 1, "loss_bbox_enc": 5, "loss_giou_enc": 2})
-# weight_dict.update({"loss_salience": 2})
-weight_dict.update({"loss_hough": 2})
+weight_dict.update({"loss_salience": 2})
+# weight_dict.update({"loss_hough": 2})
 
 criterion = HybridSetCriterion(num_classes, matcher=matcher, weight_dict=weight_dict, alpha=0.25, gamma=2.0)
 hough_criterion = HoughCriterion(noise_scale=0.0, alpha=0.25, gamma=2.0)
+foreground_criterion = SalienceCriterion(noise_scale=0.0, alpha=0.25, gamma=2.0)
 postprocessor = PostProcess(select_box_nums_for_evaluation=300)
 
 # combine above components to instantiate the model
@@ -106,7 +107,8 @@ model = HoughDETR(
     transformer=transformer,
     criterion=criterion,
     postprocessor=postprocessor,
-    hough_criterion=hough_criterion,
+    # hough_criterion=hough_criterion,
+    focus_criterion=foreground_criterion,
     num_classes=num_classes,
     num_queries=num_queries,
     aux_loss=True,
