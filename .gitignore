@@ -17,3 +17,10 @@ transforms/__pycache__/
 transforms/v2/__pycache__/
 transforms/v2/functional/__pycache__/
 util/__pycache__/
+
+.ipynb_checkpoints/
+checkpoints/
+configs/.ipynb_checkpoints/
+models/bricks/.ipynb_checkpoints/
+models/detectors/.ipynb_checkpoints/
+

@@ -15,38 +15,38 @@ from models.bricks.position_encoding import PositionEmbeddingLearned, get_sine_p
 from util.misc import inverse_sigmoid
 
 
-class MaskPredictor(nn.Module):
-    def __init__(self, in_dim, h_dim):
-        super().__init__()
-        self.h_dim = h_dim
-        self.layer1 = nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, h_dim),
-            nn.GELU(),
-        )
-        self.layer2 = nn.Sequential(
-            nn.Linear(h_dim, h_dim // 2),
-            nn.GELU(),
-            nn.Linear(h_dim // 2, h_dim // 4),
-            nn.GELU(),
-            nn.Linear(h_dim // 4, 1),
-        )
+# class MaskPredictor(nn.Module):
+#     def __init__(self, in_dim, h_dim):
+#         super().__init__()
+#         self.h_dim = h_dim
+#         self.layer1 = nn.Sequential(
+#             nn.LayerNorm(in_dim),
+#             nn.Linear(in_dim, h_dim),
+#             nn.GELU(),
+#         )
+#         self.layer2 = nn.Sequential(
+#             nn.Linear(h_dim, h_dim // 2),
+#             nn.GELU(),
+#             nn.Linear(h_dim // 2, h_dim // 4),
+#             nn.GELU(),
+#             nn.Linear(h_dim // 4, 1),
+#         )
 
-        self.apply(self.init_weights)
+#         self.apply(self.init_weights)
 
-    @staticmethod
-    def init_weights(m):
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
-            nn.init.constant_(m.bias, 0)
+#     @staticmethod
+#     def init_weights(m):
+#         if isinstance(m, nn.Linear):
+#             nn.init.xavier_uniform_(m.weight)
+#             nn.init.constant_(m.bias, 0)
 
-    def forward(self, x):
-        z = self.layer1(x)
-        z_local, z_global = torch.split(z, self.h_dim // 2, dim=-1)
-        z_global = z_global.mean(dim=1, keepdim=True).expand(-1, z_local.shape[1], -1)
-        z = torch.cat([z_local, z_global], dim=-1)
-        out = self.layer2(z)
-        return out
+#     def forward(self, x):
+#         z = self.layer1(x)
+#         z_local, z_global = torch.split(z, self.h_dim // 2, dim=-1)
+#         z_global = z_global.mean(dim=1, keepdim=True).expand(-1, z_local.shape[1], -1)
+#         z = torch.cat([z_local, z_global], dim=-1)
+#         out = self.layer2(z)
+#         return out
 
 
 BN_MOMENTUM = 0.1
@@ -294,6 +294,11 @@ class HoughTransformer(TwostageTransformer):
             mask = mask_flatten[:, start_index:end_index]
             # reshape level_memory to match spatial dimensions (b, c, h_i, w_i)
             level_memory = level_memory.permute(0, 2, 1).view(batch_size, -1, *spatial_shapes[level_idx])
+            
+            # resolve unused alpha issue
+            if level_idx < 3:
+                dummy = self.alpha[level_idx] * 0.0
+                level_memory = level_memory + dummy
 
             # if level_idx != spatial_shapes.shape[0] - 1:
             #     # Upsample to the first level's resolution

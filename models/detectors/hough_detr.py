@@ -402,191 +402,191 @@ class HoughCriterion(nn.Module):
 
 
 
-# TODO: plot features points within targets in levels
-import torch
-import matplotlib.pyplot as plt
-import numpy as np
-from PIL import Image
+# # TODO: plot features points within targets in levels
+# import torch
+# import matplotlib.pyplot as plt
+# import numpy as np
+# from PIL import Image
 
-from torchvision.transforms.functional import to_pil_image
-from torchvision.utils import draw_bounding_boxes
+# from torchvision.transforms.functional import to_pil_image
+# from torchvision.utils import draw_bounding_boxes
 
-import random
-import string
+# import random
+# import string
 
-def get_size(level):
-    base_size = 2
-    return base_size * (level + 2)
+# def get_size(level):
+#     base_size = 2
+#     return base_size * (level + 2)
 
-def denormalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
-    image = image.clone()  # 创建副本以避免修改原始数据
-    for t, m, s in zip(image, mean, std):
-        t.mul_(s).add_(m)  # 反标准化
-    return image
+# def denormalize(image, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]):
+#     image = image.clone()  # 创建副本以避免修改原始数据
+#     for t, m, s in zip(image, mean, std):
+#         t.mul_(s).add_(m)  # 反标准化
+#     return image
 
-def tensor_to_pil(image_tensor):
-    image = denormalize(image_tensor)
-    image = image.mul(255).clamp(0, 255).byte()  # 转换到 0-255 范围
-    image = image.cpu().permute(1, 2, 0).numpy()
-    return Image.fromarray(image)
-
-def visualize_points_in_targets(points_in_targets, image):
-    plt.figure(figsize=(12, 12))
-    
-    # Convert image tensor to PIL Image
-    image_pil = tensor_to_pil(image)
-    
-    # Create a new tensor for drawing bounding boxes
-    draw_image = torch.tensor(np.array(image_pil)).permute(2, 0, 1)
-    
-    boxes = []
-    labels = []
-    colors = []
-    
-    for item in points_in_targets:
-        points = item['points'].cpu().numpy()
-        box = item['box'].cpu()
-        label = item['label'].item()
-        level = item['level']
-        size = get_size(level)
-        
-        # Plot points
-        plt.scatter(points[:, 0], points[:, 1], s=size, alpha=0.5)
-        
-        # Prepare box and label for drawing
-        boxes.append(box)
-        labels.append(f"Label: {label}, Level: {level}")
-        colors.append("red")
-
-    # Draw all bounding boxes at once
-    draw_image = draw_bounding_boxes(draw_image, torch.stack(boxes), labels, colors, width=2)
-    
-    # Convert back to PIL and display
-    plt.imshow(to_pil_image(draw_image))
-    plt.axis('off')
-    letters = string.ascii_lowercase
-    random_str = ''.join(random.choice(letters) for i in range(4))
-    filename = f'visualization_{random_str}.png'
-    plt.savefig(filename)
-    plt.close()
-    # plt.show()
+# def tensor_to_pil(image_tensor):
+#     image = denormalize(image_tensor)
+#     image = image.mul(255).clamp(0, 255).byte()  # 转换到 0-255 范围
+#     image = image.cpu().permute(1, 2, 0).numpy()
+#     return Image.fromarray(image)
 
 # def visualize_points_in_targets(points_in_targets, image):
 #     plt.figure(figsize=(12, 12))
-#     plt.imshow(image)
-
+    
+#     # Convert image tensor to PIL Image
+#     image_pil = tensor_to_pil(image)
+    
+#     # Create a new tensor for drawing bounding boxes
+#     draw_image = torch.tensor(np.array(image_pil)).permute(2, 0, 1)
+    
+#     boxes = []
+#     labels = []
+#     colors = []
+    
 #     for item in points_in_targets:
-#         points = item['points']
-#         box = item['box']
-#         label = item['label']
+#         points = item['points'].cpu().numpy()
+#         box = item['box'].cpu()
+#         label = item['label'].item()
 #         level = item['level']
-#         item['']
-#         # 绘制点
-#         plt.scatter(points[:, 0], points[:, 1], s=1, alpha=0.5)
-#         # 绘制边界框
-#         rect = plt.Rectangle((box[0], box[1]), box[2]-box[0], box[3]-box[1],
-#                              fill=False, edgecolor='r', linewidth=2)
-#         plt.gca().add_patch(rect)
-#         # 添加标签
-#         # plt.text(box[0], box[1], f'Label: {label}', color='r', fontsize=8)
+#         size = get_size(level)
+        
+#         # Plot points
+#         plt.scatter(points[:, 0], points[:, 1], s=size, alpha=0.5)
+        
+#         # Prepare box and label for drawing
+#         boxes.append(box)
+#         labels.append(f"Label: {label}, Level: {level}")
+#         colors.append("red")
+
+#     # Draw all bounding boxes at once
+#     draw_image = draw_bounding_boxes(draw_image, torch.stack(boxes), labels, colors, width=2)
+    
+#     # Convert back to PIL and display
+#     plt.imshow(to_pil_image(draw_image))
 #     plt.axis('off')
-#     plt.show()
+#     letters = string.ascii_lowercase
+#     random_str = ''.join(random.choice(letters) for i in range(4))
+#     filename = f'visualization_{random_str}.png'
+#     plt.savefig(filename)
+#     plt.close()
+#     # plt.show()
 
-def get_pixel_coordinate(feature_shape, stride, device):
-    height, width = feature_shape
-    coord_y, coord_x = torch.meshgrid(
-        torch.linspace(0.5, height - 0.5, height, dtype=torch.float32, device=device) * stride[0],
-        torch.linspace(0.5, width - 0.5, width, dtype=torch.float32, device=device) * stride[1],
-        indexing="ij",
-    )
-    coord_y = coord_y.reshape(-1)
-    coord_x = coord_x.reshape(-1)
-    return coord_x, coord_y
+# # def visualize_points_in_targets(points_in_targets, image):
+# #     plt.figure(figsize=(12, 12))
+# #     plt.imshow(image)
 
-def get_targets_info(feature_maps, targets, feature_strides, image_sizes):
-    # gt_boxes_list: [{boxes, labels}] len() = batch, boxes: the boxes in one image
-    # ground-truth target real coords
-    gt_boxes_list = []
-    for t, (img_h, img_w) in zip(targets, image_sizes):
-        boxes = t["boxes"]
-        labels = t["labels"]
-        boxes = box_ops._box_cxcywh_to_xyxy(boxes)
-        scale_factor = torch.tensor([img_w, img_h, img_w, img_h], device=boxes.device)
-        gt_boxes_list.append(((boxes * scale_factor), labels))
+# #     for item in points_in_targets:
+# #         points = item['points']
+# #         box = item['box']
+# #         label = item['label']
+# #         level = item['level']
+# #         item['']
+# #         # 绘制点
+# #         plt.scatter(points[:, 0], points[:, 1], s=1, alpha=0.5)
+# #         # 绘制边界框
+# #         rect = plt.Rectangle((box[0], box[1]), box[2]-box[0], box[3]-box[1],
+# #                              fill=False, edgecolor='r', linewidth=2)
+# #         plt.gca().add_patch(rect)
+# #         # 添加标签
+# #         # plt.text(box[0], box[1], f'Label: {label}', color='r', fontsize=8)
+# #     plt.axis('off')
+# #     plt.show()
 
-    points_in_targets_map = defaultdict(list)
-    for level_idx, (feat_map, feature_stride) in enumerate(zip(feature_maps, feature_strides)):
-        feature_shape = feat_map.shape[-2:]
-        coord_x, coord_y = get_pixel_coordinate(
-            feature_shape, feature_stride, device=feat_map.device)
+# def get_pixel_coordinate(feature_shape, stride, device):
+#     height, width = feature_shape
+#     coord_y, coord_x = torch.meshgrid(
+#         torch.linspace(0.5, height - 0.5, height, dtype=torch.float32, device=device) * stride[0],
+#         torch.linspace(0.5, width - 0.5, width, dtype=torch.float32, device=device) * stride[1],
+#         indexing="ij",
+#     )
+#     coord_y = coord_y.reshape(-1)
+#     coord_x = coord_x.reshape(-1)
+#     return coord_x, coord_y
 
-        for img_idx, (gt_boxes, labels) in enumerate(gt_boxes_list):
-            points_per_image = []
-            # (h_i*w_i, m)
-            mask_in_gt_boxes, coord_x, coord_y = filter_mask_in_target(coord_x, coord_y, gt_boxes)
-            # 对每个目标框单独处理
-            for box_idx in range(gt_boxes.shape[0]):
-                mask_for_box = mask_in_gt_boxes[:, box_idx]
-                points_in_box_x = coord_x[mask_for_box]
-                points_in_box_y = coord_y[mask_for_box]
-                points_in_box = torch.stack([points_in_box_x, points_in_box_y], dim=1)
-                points_per_image.append({
-                    'points': points_in_box,
-                    'box': gt_boxes[box_idx],
-                    'label': labels[box_idx],
-                    'level': level_idx,
-                    'boxIdx': box_idx,
-                })
-            points_in_targets_map[img_idx].extend(points_per_image)
+# def get_targets_info(feature_maps, targets, feature_strides, image_sizes):
+#     # gt_boxes_list: [{boxes, labels}] len() = batch, boxes: the boxes in one image
+#     # ground-truth target real coords
+#     gt_boxes_list = []
+#     for t, (img_h, img_w) in zip(targets, image_sizes):
+#         boxes = t["boxes"]
+#         labels = t["labels"]
+#         boxes = box_ops._box_cxcywh_to_xyxy(boxes)
+#         scale_factor = torch.tensor([img_w, img_h, img_w, img_h], device=boxes.device)
+#         gt_boxes_list.append(((boxes * scale_factor), labels))
 
-    return points_in_targets_map
+#     points_in_targets_map = defaultdict(list)
+#     for level_idx, (feat_map, feature_stride) in enumerate(zip(feature_maps, feature_strides)):
+#         feature_shape = feat_map.shape[-2:]
+#         coord_x, coord_y = get_pixel_coordinate(
+#             feature_shape, feature_stride, device=feat_map.device)
 
-def filter_mask_in_target(coord_x, coord_y, gt_boxes):
-    left_border_distance = coord_x[:, None] - gt_boxes[None, :, 0]  # (h*w, m)
-    top_border_distance = coord_y[:, None] - gt_boxes[None, :, 1]
-    right_border_distance = gt_boxes[None, :, 2] - coord_x[:, None]
-    bottom_border_distance = gt_boxes[None, :, 3] - coord_y[:, None]
-    border_distances = torch.stack(
-        [left_border_distance, top_border_distance, right_border_distance, bottom_border_distance],
-        dim=-1,
-    )  # (h*w, m, 4)
-    min_border_distances = torch.min(border_distances, dim=-1)[0]  # (h*w, m)
-    mask_in_gt_boxes = min_border_distances > 0
-    return mask_in_gt_boxes, coord_x, coord_y
+#         for img_idx, (gt_boxes, labels) in enumerate(gt_boxes_list):
+#             points_per_image = []
+#             # (h_i*w_i, m)
+#             mask_in_gt_boxes, coord_x, coord_y = filter_mask_in_target(coord_x, coord_y, gt_boxes)
+#             # 对每个目标框单独处理
+#             for box_idx in range(gt_boxes.shape[0]):
+#                 mask_for_box = mask_in_gt_boxes[:, box_idx]
+#                 points_in_box_x = coord_x[mask_for_box]
+#                 points_in_box_y = coord_y[mask_for_box]
+#                 points_in_box = torch.stack([points_in_box_x, points_in_box_y], dim=1)
+#                 points_per_image.append({
+#                     'points': points_in_box,
+#                     'box': gt_boxes[box_idx],
+#                     'label': labels[box_idx],
+#                     'level': level_idx,
+#                     'boxIdx': box_idx,
+#                 })
+#             points_in_targets_map[img_idx].extend(points_per_image)
 
-def get_single_image_from_image_list(image_list, index: int):
-    batched_images = image_list.tensors
-    # 获取原始图像尺寸
-    original_size = image_list.image_sizes[index]
-    # 提取单张图像
-    single_image = batched_images[index]
-    # 裁剪到原始尺寸
-    single_image = single_image[:, :original_size[0], :original_size[1]]
-    return single_image
+#     return points_in_targets_map
 
-def plot_targets(images, targets, multi_level_feats):
-    feature_strides = [(
-        images.tensors.shape[-2] // feature.shape[-2],
-        images.tensors.shape[-1] // feature.shape[-1],
-    ) for feature in multi_level_feats]
+# def filter_mask_in_target(coord_x, coord_y, gt_boxes):
+#     left_border_distance = coord_x[:, None] - gt_boxes[None, :, 0]  # (h*w, m)
+#     top_border_distance = coord_y[:, None] - gt_boxes[None, :, 1]
+#     right_border_distance = gt_boxes[None, :, 2] - coord_x[:, None]
+#     bottom_border_distance = gt_boxes[None, :, 3] - coord_y[:, None]
+#     border_distances = torch.stack(
+#         [left_border_distance, top_border_distance, right_border_distance, bottom_border_distance],
+#         dim=-1,
+#     )  # (h*w, m, 4)
+#     min_border_distances = torch.min(border_distances, dim=-1)[0]  # (h*w, m)
+#     mask_in_gt_boxes = min_border_distances > 0
+#     return mask_in_gt_boxes, coord_x, coord_y
 
-    target_map = get_targets_info(
-        multi_level_feats, targets, feature_strides, images.image_sizes)
+# def get_single_image_from_image_list(image_list, index: int):
+#     batched_images = image_list.tensors
+#     # 获取原始图像尺寸
+#     original_size = image_list.image_sizes[index]
+#     # 提取单张图像
+#     single_image = batched_images[index]
+#     # 裁剪到原始尺寸
+#     single_image = single_image[:, :original_size[0], :original_size[1]]
+#     return single_image
 
-    for img_idx in range(len(images.image_sizes)):
-        box_idx, level_idx = -1, -1
-        # plot by targets and levels
-        points_in_target = []
-        for l_tgt in target_map[img_idx]:
-            cur_level = l_tgt['level']
-            cur_box_idx = l_tgt['boxIdx']
-            if (box_idx == -1 or cur_box_idx == box_idx) and \
-                (level_idx == -1 or cur_level == level_idx):
-                points_in_target.append(l_tgt)
+# def plot_targets(images, targets, multi_level_feats):
+#     feature_strides = [(
+#         images.tensors.shape[-2] // feature.shape[-2],
+#         images.tensors.shape[-1] // feature.shape[-1],
+#     ) for feature in multi_level_feats]
 
-        image = get_single_image_from_image_list(images, img_idx)
-        visualize_points_in_targets(points_in_target, image)
-    print("Visualization saved as 'visualization.png'")
+#     target_map = get_targets_info(
+#         multi_level_feats, targets, feature_strides, images.image_sizes)
+
+#     for img_idx in range(len(images.image_sizes)):
+#         box_idx, level_idx = -1, -1
+#         # plot by targets and levels
+#         points_in_target = []
+#         for l_tgt in target_map[img_idx]:
+#             cur_level = l_tgt['level']
+#             cur_box_idx = l_tgt['boxIdx']
+#             if (box_idx == -1 or cur_box_idx == box_idx) and \
+#                 (level_idx == -1 or cur_level == level_idx):
+#                 points_in_target.append(l_tgt)
+
+#         image = get_single_image_from_image_list(images, img_idx)
+#         visualize_points_in_targets(points_in_target, image)
+#     print("Visualization saved as 'visualization.png'")
 
 
 
