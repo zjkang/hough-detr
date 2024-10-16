@@ -665,6 +665,7 @@ class HoughTransformerDecoder(nn.Module):
         self.embed_dim = decoder_layer.embed_dim
         self.num_layers = num_layers
         self.num_classes = num_classes
+        self.cross_attn_type = decoder_layer.cross_attn_type # ['def', 'sin_scale', 'mul_scale', 'other']
 
         # decoder layers and embedding
         self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
@@ -704,7 +705,6 @@ class HoughTransformerDecoder(nn.Module):
         key_padding_mask=None,
         attn_mask=None, # self-attention mask
         memory_mask=None, # cross-attention mask
-        cross_attn_type='sin_scale' # ['def', 'sin_scale', 'mul_scale', 'other']
     ):
         outputs_classes = []
         outputs_coords = []
@@ -712,7 +712,7 @@ class HoughTransformerDecoder(nn.Module):
         valid_ratio_scale = torch.cat([valid_ratios, valid_ratios], -1)[:, None]
 
         for layer_idx, layer in enumerate(self.layers):
-            # reference_points: (batch_size, num_queries, 1, 4)
+            # reference_points: (batch_size, num_queries, 4)
             # 乘法的效果：
             # 假设 reference_points 中有一个坐标 [1.0, 1.0]（特征图的右下角）。
             # 如果 valid_ratios 为 [0.8, 0.9]，乘法后坐标变为 [0.8, 0.9]。
@@ -722,19 +722,16 @@ class HoughTransformerDecoder(nn.Module):
             query_sine_embed = get_sine_pos_embed(reference_points_input[:, :, 0, :])
             query_pos = self.ref_point_head(query_sine_embed)
 
-            if cross_attn_type == 'def':
+            if self.cross_attn_type == 'def':
                 pass
-            elif cross_attn_type == 'sin_scale':
+            elif self.cross_attn_type == 'sin_scale':
                 # single scale
                 memory_mask = gen_memory_mask(
                     reference_points_input, spatial_shapes, valid_ratios, layer.num_heads)
                 memory_mask = torch.cat(memory_mask, dim=-1)
-            elif cross_attn_type == 'mul_scale':
+            elif self.cross_attn_type == 'mul_scale':
                 memory_mask = gen_memory_mask(
                     reference_points_input, spatial_shapes, valid_ratios, layer.num_heads)
-
-            # multi-scale
-            # memory_mask = gen_memory_mask(reference_points_input, spatial_shapes, valid_ratios, layer.num_heads)
 
 
             # relation embedding
@@ -775,7 +772,7 @@ class HoughTransformerDecoder(nn.Module):
 # memory: encoder outut
 # 用于在注意力机制中限制每个查询只关注其相关的区域 for cross-attention
 def gen_memory_mask(
-        reference_points, # 参考点，通常是预测的边界框 reference_points (batch_size, num_queries, 4)
+        reference_points, # 参考点，通常是预测的边界框 (batch_size, num_queries, num_levels, 4) -> 4: (x_c,y_c,w,h)
         spatial_shapes, # [(h_i,w_i)]
         valid_ratios, # (batch_size, num_levels, 2)
         num_heads):
@@ -794,9 +791,9 @@ def gen_memory_mask(
             for bs in range(reference_points.shape[0]):
                 # 获取当前批次的参考点
                 # ref: (num_queries, 4)
-                ref = reference_points[bs,:,:]
+                ref = reference_points[bs,:,level,:]
                 # 获取当前批次和级别的源图像高度和宽度
-                h,w = spatial_shapes[level] * valid_ratios[bs][level]
+                h,w = spatial_shapes[level]
                 ref = box_ops._box_cxcywh_to_xyxy(ref)
                 # 将边界框坐标转换为整数像素坐标，并确保在有效范围内
                 ref[:,0] = torch.clamp(torch.floor(ref[:,0]*w),min=0,max=w-1)
