@@ -6,7 +6,7 @@ from optimizer import param_dict
 
 # Commonly changed training configurations
 num_epochs = 12   # train epochs
-batch_size = 1    # total_batch_size = #GPU x batch_size
+batch_size = 2    # total_batch_size = #GPU x batch_size
 num_workers = 4   # workers for pytorch DataLoader
 pin_memory = True # whether pin_memory for pytorch DataLoader
 print_freq = 50   # frequency to print logs
@@ -40,7 +40,7 @@ model_path = "configs/hough_detr/hough_detr_resnet50_800_1333.py"
 # checkpoints/salience_detr_resnet50_800_1333/train/2024-03-22-09_38_50
 # checkpoints/salience_detr_resnet50_800_1333/train/2024-03-22-09_38_50/best_ap.pth
 #resume_from_checkpoint = 'checkpoints/salience_detr_resnet50_800_1333/train/2024-03-22-09_38_50'
-resume_from_checkpoint = 'checkpoints/hough_detr_resnet50_800_1333/train/2024-10-16-13_40_56'
+resume_from_checkpoint = None #'checkpoints/hough_detr_resnet50_800_1333/train/2024-10-16-13_40_56'
 
 learning_rate = 1e-4  # initial learning rate
 optimizer = optim.AdamW(lr=learning_rate, weight_decay=1e-4, betas=(0.9, 0.999))

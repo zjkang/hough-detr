@@ -70,7 +70,7 @@ transformer = HoughTransformer(
             n_levels=num_feature_levels,
             n_points=4,
             d_ffn=dim_feedforward,
-            cross_attn_type='sin_scale',
+            cross_attn_type='def',
         ),
         num_layers=transformer_dec_layers,
         num_classes=num_classes,

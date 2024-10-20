@@ -5,6 +5,8 @@ from typing import Tuple
 import torch
 import torchvision
 from torch import nn
+import torch.nn.functional as F
+
 
 from models.bricks.base_transformer import TwostageTransformer
 from models.bricks.basic import MLP
@@ -13,6 +15,7 @@ from models.bricks.position_encoding import PositionEmbeddingLearned, get_sine_p
 from util.misc import inverse_sigmoid
 
 from torchvision.ops import boxes as box_ops
+
 
 
 class MaskPredictor(nn.Module):
@@ -60,6 +63,7 @@ class HoughTransformer(TwostageTransformer):
         two_stage_num_proposals: int = 900,
         level_filter_ratio: Tuple = (0.25, 0.5, 1.0, 1.0),
         layer_filter_ratio: Tuple = (1.0, 0.8, 0.6, 0.6, 0.4, 0.2),
+        num_votes: int = 16,
     ):
         super().__init__(num_feature_levels, encoder.embed_dim)
         # model parameters
@@ -80,6 +84,10 @@ class HoughTransformer(TwostageTransformer):
         self.encoder_bbox_head = MLP(self.embed_dim, self.embed_dim, 4, 3)
         self.encoder.enhance_mcsp = self.encoder_class_head
         self.enc_mask_predictor = MaskPredictor(self.embed_dim, self.embed_dim)
+
+        # NOTE: Multi-scale HoughNetVoting module
+        self.num_votes = num_votes
+        self.hough_voting = MultiScaleHoughNetVoting(self.embed_dim, num_votes)
 
         self.init_weights()
 
@@ -222,6 +230,22 @@ class HoughTransformer(TwostageTransformer):
             target = torch.cat([noised_label_query, target], 1)
             reference_points = torch.cat([noised_box_query.sigmoid(), reference_points], 1)
 
+
+        # # Apply HoughNetVoting
+        # memory: (b, sum(h_i*w_i), embed_dim)
+        vote_fields = []
+        memories = []
+        for level_idx in range(spatial_shapes.shape[0]):
+            start_index = level_start_index[level_idx]
+            end_index = level_start_index[level_idx + 1] if level_idx < spatial_shapes.shape[0] - 1 else None
+            # level_memory: (b, h_i*w_i, embed_dim)
+            memories.append(memory[:, start_index:end_index, :])
+        
+        # [(batch_size, num_votes, vote_dim, h_i, w_i)]
+        vote_fields = self.hough_voting([m.permute(0, 2, 1).view(
+            batch_size, self.embed_dim, spatial_shapes[level_idx][0], spatial_shapes[level_idx][1])\
+                for level_idx, m in enumerate(memories)])
+        
         # decoder
         outputs_classes, outputs_coords = self.decoder(
             query=target,
@@ -233,6 +257,7 @@ class HoughTransformer(TwostageTransformer):
             level_start_index=level_start_index,
             valid_ratios=valid_ratios,
             attn_mask=attn_mask,
+            vote_fields=vote_fields,
         )
 
         return outputs_classes, outputs_coords, enc_outputs_class, enc_outputs_coord, salience_score
@@ -510,13 +535,14 @@ class HoughTransformerDecoderLayer(nn.Module):
         activation=nn.ReLU(inplace=True),
         n_levels=4,
         n_points=4,
-        cross_attn_type='sin_scale' # ['def', 'sin_scale', 'mul_scale', 'other']
+        cross_attn_type='sin_scale' # ['def', 'sin_scale', 'mul_scale', 'hough']
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = n_heads
 
         # cross attention
+        self.cross_attn_type = cross_attn_type
         # v1 original
         if cross_attn_type == 'def':
             self.cross_attn = MultiScaleDeformableAttention(
@@ -533,9 +559,17 @@ class HoughTransformerDecoderLayer(nn.Module):
                     for _ in range(n_levels)])
             # se module for level wise attn
             self.lvl_attn = nn.Linear(embed_dim, n_levels)
-
-        self.cross_attn_type = cross_attn_type
-
+        # v4 hough
+        elif cross_attn_type == 'hough':
+            self.cross_attn = MultiScaleDeformableAttention(
+                embed_dim, n_levels, n_heads, n_points)
+            self.query_hough = HoughVotingLayer(embed_dim, 31)
+            # 新的融合机制：使用多头注意力来融合三种信息
+            self.fusion_attn = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout, batch_first=True)
+            self.dropout10 = nn.Dropout(dropout)
+            self.norm10 = nn.LayerNorm(embed_dim)
+            
+        # cross attention
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(embed_dim)
 
@@ -584,6 +618,7 @@ class HoughTransformerDecoderLayer(nn.Module):
         self_attn_mask=None,
         memory_mask=None,
         key_padding_mask=None,
+        valid_ratios=None,
     ):
         # self attention
         query_with_pos = key_with_pos = self.with_pos_embed(query, query_pos)
@@ -596,9 +631,10 @@ class HoughTransformerDecoderLayer(nn.Module):
         query = query + self.dropout2(query2)
         query = self.norm2(query)
 
+
         # cross attention
+        # v1 original
         if self.cross_attn_type == 'def':
-             # v1 original
             query2 = self.cross_attn(
                 query=self.with_pos_embed(query, query_pos),
                 reference_points=reference_points,
@@ -607,8 +643,12 @@ class HoughTransformerDecoderLayer(nn.Module):
                 level_start_index=level_start_index,
                 key_padding_mask=key_padding_mask,
             )
+            query = query + self.dropout1(query2)
+            query = self.norm1(query)
+        # v2 single scale
         elif self.cross_attn_type == 'sin_scale':
-            # v2 single scale
+            memory_mask = gen_memory_mask(reference_points, spatial_shapes, valid_ratios, self.num_heads)
+            memory_mask = torch.cat(memory_mask, dim=-1)
             query2 = self.cross_attn(
                 query=self.with_pos_embed(query, query_pos),
                 key=self.with_pos_embed(value, value_pos),
@@ -616,8 +656,11 @@ class HoughTransformerDecoderLayer(nn.Module):
                 attn_mask=memory_mask,
                 key_padding_mask=key_padding_mask,
             )[0]
+            query = query + self.dropout1(query2)
+            query = self.norm1(query)
         # v3 multi-scale
         elif self.cross_attn_type == 'mul_scale':
+            memory_mask = gen_memory_mask(reference_points, spatial_shapes, valid_ratios, self.num_heads)
             tmp_query = self.with_pos_embed(query, query_pos)
             query2_list = []
             for idx, (start, end) in enumerate(zip(level_start_index, level_start_index[1:] + [value.shape[1]])):
@@ -626,7 +669,7 @@ class HoughTransformerDecoderLayer(nn.Module):
                 key_padding_mask_level = key_padding_mask[:, start:end] if key_padding_mask is not None else None
                 memory_mask_level = memory_mask[idx] if memory_mask is not None else None
 
-                query2_i, _ = self.cross_attn_list[idx](
+                query2_i, _ = self.cross_attn[idx](
                     query=tmp_query,
                     key=self.with_pos_embed(value_level, value_pos_level),
                     value=value_level,
@@ -647,10 +690,33 @@ class HoughTransformerDecoderLayer(nn.Module):
             query2_all = torch.stack(query2_list)
             # query2: (batch_size, num_queries, embed_dim)
             query2 = (query2_all * level_weight).sum(0)
+            query = query + self.dropout1(query2)
+            query = self.norm1(query)
+        elif self.cross_attn_type == 'hough':
+            query3 = self.cross_attn(
+                query=self.with_pos_embed(query, query_pos),
+                reference_points=reference_points,
+                value=value,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+                key_padding_mask=key_padding_mask,
+            )
+            query = query + self.dropout1(query3)
+            query = self.norm1(query)
 
-
-        query = query + self.dropout1(query2)
-        query = self.norm1(query)
+            # 应用Hough voting到query
+            hough_query = self.query_hough(query)
+            # 融合原始query、cross-attention输出和Hough voting结果
+            # 使用多头注意力机制来融合这三种信息
+            # 形状变化：[batch_size, num_queries, emd_dim] -> [batch_size, 3, num_queries, emd_dim]
+            fusion_input = torch.stack([query2, query3, hough_query], dim=1)
+            # 重塑以适应多头注意力的输入要求
+            # 形状变化：[batch_size, 3, num_queries, d_model] -> [batch_size, 3*num_queries, d_model]
+            fusion_input_reshaped = fusion_input.view(fusion_input.size(0), -1, fusion_input.size(-1))
+            fused_query, _ = self.fusion_attn(query, fusion_input_reshaped, fusion_input_reshaped)
+            query = query + self.dropout10(fused_query)
+            query = self.norm10(query)
+    
 
         # ffn
         query = self.forward_ffn(query)
@@ -659,22 +725,41 @@ class HoughTransformerDecoderLayer(nn.Module):
 
 
 class HoughTransformerDecoder(nn.Module):
-    def __init__(self, decoder_layer, num_layers, num_classes):
+    def __init__(self, decoder_layer, num_layers, num_classes, num_votes=16, num_levels=4):
         super().__init__()
         # parameters
         self.embed_dim = decoder_layer.embed_dim
         self.num_layers = num_layers
         self.num_classes = num_classes
-        self.cross_attn_type = decoder_layer.cross_attn_type # ['def', 'sin_scale', 'mul_scale', 'other']
+        self.num_votes = num_votes
+        self.num_levels = num_levels
 
         # decoder layers and embedding
         self.layers = nn.ModuleList([copy.deepcopy(decoder_layer) for _ in range(num_layers)])
         self.ref_point_head = MLP(2 * self.embed_dim, self.embed_dim, self.embed_dim, 2)
+        # NOTE: from relation-detr
+        self.query_scale = MLP(self.embed_dim, self.embed_dim, self.embed_dim, 2)
 
         # iterative bounding box refinement
         self.class_head = nn.ModuleList([nn.Linear(self.embed_dim, num_classes) for _ in range(num_layers)])
         self.bbox_head = nn.ModuleList([MLP(self.embed_dim, self.embed_dim, 4, 3) for _ in range(num_layers)])
         self.norm = nn.LayerNorm(self.embed_dim)
+
+        # Adjust the input dimension of refine_points
+        # self.refine_points = nn.Sequential(
+        #     nn.Linear(self.embed_dim + 4 + self.num_votes * 2 * self.num_levels, self.embed_dim), # 4: reference_point, 2: x,y
+        #     nn.ReLU(),
+        #     nn.Linear(self.embed_dim, 4)
+        # )
+        self.refine_points = nn.Sequential(
+            nn.Linear(self.embed_dim + 4 + self.num_votes * 2 * self.num_levels, self.embed_dim),
+            nn.ReLU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.ReLU(),
+            nn.Linear(self.embed_dim, 4),
+            nn.Tanh()  # 使用 Tanh 将输出限制在 [-1, 1] 范围内
+        )
+        self.refine_scale = nn.Parameter(torch.tensor(0.1))  # 可学习的缩放因子
 
         self.init_weights()
 
@@ -693,6 +778,20 @@ class HoughTransformerDecoder(nn.Module):
             nn.init.constant_(bbox_head.layers[-1].weight, 0.0)
             nn.init.constant_(bbox_head.layers[-1].bias, 0.0)
 
+        # 初始化第一层
+        nn.init.xavier_uniform_(self.refine_points[0].weight, gain=1/math.sqrt(2))
+        nn.init.constant_(self.refine_points[0].bias, 0)
+        # 初始化中间层
+        nn.init.xavier_uniform_(self.refine_points[2].weight, gain=1/math.sqrt(2))
+        nn.init.constant_(self.refine_points[2].bias, 0)
+        # 初始化最后一层（输出层）
+        nn.init.xavier_uniform_(self.refine_points[4].weight, gain=1e-2)
+        nn.init.constant_(self.refine_points[4].bias, 0)
+
+    @staticmethod
+    def with_pos_embed(tensor, pos):
+        return tensor if pos is None else tensor + pos
+
     def forward(
         self,
         query,
@@ -705,6 +804,7 @@ class HoughTransformerDecoder(nn.Module):
         key_padding_mask=None,
         attn_mask=None, # self-attention mask
         memory_mask=None, # cross-attention mask
+        vote_fields=None,
     ):
         outputs_classes = []
         outputs_coords = []
@@ -721,18 +821,8 @@ class HoughTransformerDecoder(nn.Module):
             reference_points_input = reference_points.detach()[:, :, None] * valid_ratio_scale
             query_sine_embed = get_sine_pos_embed(reference_points_input[:, :, 0, :])
             query_pos = self.ref_point_head(query_sine_embed)
-
-            if self.cross_attn_type == 'def':
-                pass
-            elif self.cross_attn_type == 'sin_scale':
-                # single scale
-                memory_mask = gen_memory_mask(
-                    reference_points_input, spatial_shapes, valid_ratios, layer.num_heads)
-                memory_mask = torch.cat(memory_mask, dim=-1)
-            elif self.cross_attn_type == 'mul_scale':
-                memory_mask = gen_memory_mask(
-                    reference_points_input, spatial_shapes, valid_ratios, layer.num_heads)
-
+            # NOTE: relation-detr
+            query_pos = query_pos * self.query_scale(query) if layer_idx != 0 else query_pos
 
             # relation embedding
             query = layer(
@@ -757,6 +847,38 @@ class HoughTransformerDecoder(nn.Module):
 
             if layer_idx == self.num_layers - 1:
                 break
+            
+            # if not skip_relation:
+            #     # src_boxes：对于第一层（layer_idx == 0），它使用初始的 reference_points。
+            #     # 对于后续层，它使用上一层的 tgt_boxes。
+            #     # tgt_boxes：总是使用当前层的 output_coord。
+            #     # 迭代细化过程 - 在每一层，模型都在尝试改进之前的预测
+            #     # src_boxes 代表上一次的预测（或初始猜测）。
+            #     # tgt_boxes 代表当前层的新预测
+            #     src_boxes = tgt_boxes if layer_idx >= 1 else reference_points
+            #     tgt_boxes = output_coord
+            #     pos_relation = self.position_relation_embedding(src_boxes, tgt_boxes).flatten(0, 1)
+            #     if attn_mask is not None:
+            #         # 对于 attn_mask 中为 True 的位置，将 pos_relation 中对应位置的值设为
+            #         # float("-inf"),在后续的 softmax 操作中，这些位置会得到接近零的权重。
+            #         # 实际上这相当于完全忽略了这些位置关系
+            #         # 在注意力计算中，被掩码的位置关系将不会被考虑,模型只会关注未被掩码的位置关系
+            #         pos_relation.masked_fill_(attn_mask, float("-inf"))        
+
+
+            # Note: refinement HoughNet integration
+            if vote_fields is not None:
+                # Refine reference points using vote_fields
+                vote_info = self.sample_votes(vote_fields, reference_points)
+
+                # vote_info: [batch_size, num_queries, num_votes * vote_dim]
+                # query: (batch_size, num_queries, embed_dim)
+                refine_input = torch.cat([query, reference_points, vote_info], dim=-1)
+                # refined_deltas = self.refine_points(refine_input)
+                refined_deltas = self.refine_points(refine_input) * self.refine_scale
+                reference_points = reference_points + refined_deltas
+                reference_points = reference_points.sigmoid()  # Ensure values are in [0, 1]
+
 
             # iterative bounding box refinement
             # 通过多层迭代，reference_points 逐步细化，每一层都基于前一层的结果进行调整
@@ -766,6 +888,13 @@ class HoughTransformerDecoder(nn.Module):
         outputs_classes = torch.stack(outputs_classes)
         outputs_coords = torch.stack(outputs_coords)
         return outputs_classes, outputs_coords
+
+    def sample_votes(self, vote_fields, reference_points):
+        all_votes = []
+        for vote_field in vote_fields:
+            votes = sample_votes(vote_field, reference_points)
+            all_votes.append(votes)
+        return torch.cat(all_votes, dim=-1)
 
 
 # gen_memory_mask 函数的主要作用是为多尺度特征图生成内存掩码(memory mask)
@@ -816,3 +945,99 @@ def gen_memory_mask(
             mem_mask_list.append(mem_mask)
     # mem_mask_list: [(batch_size * num_heads, num_queries, h_i * w_i)]
     return mem_mask_list
+
+
+
+class MultiScaleHoughNetVoting(nn.Module):
+    def __init__(
+            self,
+            in_channels, 
+            num_votes=16, 
+            vote_dim=2):
+        super().__init__()
+        self.num_votes = num_votes
+        self.vote_dim = vote_dim
+        self.vote_generator = nn.Sequential(
+            nn.Conv2d(in_channels, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, num_votes * vote_dim, kernel_size=1)
+        )
+        self.weight_generator = nn.Sequential(
+            nn.Conv2d(in_channels, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, num_votes, kernel_size=1),
+            nn.Softmax(dim=1)
+        )
+
+    def forward(self, features):
+        # features: list of tensors, each of shape (batch_size, in_channels, H_i, W_i)
+        vote_fields = []
+        for feature in features:
+            batch_size, _, H, W = feature.shape
+            votes = self.vote_generator(feature)
+            votes = votes.view(batch_size, self.num_votes, self.vote_dim, H, W)
+            weights = self.weight_generator(feature)
+            weights = weights.view(batch_size, self.num_votes, 1, H, W)
+            vote_field = votes * weights
+            vote_fields.append(vote_field)
+        # [(batch_size, num_votes, vote_dim, H_i, W_i)]
+        return vote_fields
+
+
+# Update the sample_votes function if necessary
+def sample_votes(vote_field, reference_points, mode='bilinear'):
+    batch_size, num_votes, vote_dim, H, W = vote_field.shape
+    _, num_queries, _ = reference_points.shape
+    
+    center_coords = reference_points[:, :, :2]
+    normalized_coords = 2.0 * center_coords - 1.0
+    
+    vote_field = vote_field.view(batch_size, num_votes * vote_dim, H, W)
+    normalized_coords = normalized_coords.unsqueeze(1)
+    
+    sampled = F.grid_sample(vote_field, normalized_coords, mode=mode, align_corners=True)
+    sampled = sampled.squeeze(2).permute(0, 2, 1)
+    
+    return sampled  # Shape: (batch_size, num_queries, num_votes * vote_dim)
+
+# import torch
+# import torch.nn.functional as F
+
+# def sample_votes(vote_field, reference_points, mode='bilinear'):
+#     """
+#     Sample votes from the vote field at locations specified by reference points.
+    
+#     Args:
+#     - vote_field (Tensor): Shape [batch_size, num_votes, vote_dim, H, W]
+#         The vote field generated by HoughNet voting.
+#     - reference_points (Tensor): Shape [batch_size, num_queries, 4]
+#         The reference points (center_x, center_y, width, height) for each query.
+#     - mode (str): Interpolation mode for grid_sample, 'bilinear' or 'nearest'.
+    
+#     Returns:
+#     - sampled_votes (Tensor): Shape [batch_size, num_queries, num_votes * vote_dim]
+#         The sampled vote information for each query.
+#     """
+#     batch_size, num_votes, vote_dim, H, W = vote_field.shape
+#     _, num_queries, _ = reference_points.shape
+    
+#     # Extract center coordinates from reference points
+#     center_coords = reference_points[:, :, :2]  # Shape: [batch_size, num_queries, 2]
+    
+#     # Normalize center coordinates to [-1, 1] range for grid_sample
+#     normalized_coords = 2.0 * center_coords - 1.0
+    
+#     # Reshape vote_field for grid_sample
+#     vote_field = vote_field.view(batch_size, num_votes * vote_dim, H, W)
+    
+#     # Add a dummy dimension for height in grid_sample
+#     normalized_coords = normalized_coords.unsqueeze(1)  # Shape: [batch_size, 1, num_queries, 2]
+    
+#     # Sample from vote_field using grid_sample
+#     sampled = F.grid_sample(vote_field, normalized_coords, mode=mode, align_corners=True)
+    
+#     # Reshape output
+#     sampled = sampled.squeeze(2).permute(0, 2, 1)
+#     # Final shape: [batch_size, num_queries, num_votes * vote_dim]
+    
+#     return sampled
