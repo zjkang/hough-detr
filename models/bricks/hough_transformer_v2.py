@@ -536,7 +536,7 @@ class HoughTransformerDecoderLayer(nn.Module):
         activation=nn.ReLU(inplace=True),
         n_levels=4,
         n_points=4,
-        cross_attn_type='sin_scale' # ['def', 'sin_scale', 'mul_scale', 'hough']
+        cross_attn_type='def' # ['def', 'sin_scale', 'mul_scale', 'hough']
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -753,13 +753,7 @@ class HoughTransformerDecoder(nn.Module):
         self.bbox_head = nn.ModuleList([MLP(self.embed_dim, self.embed_dim, 4, 3) for _ in range(num_layers)])
         self.norm = nn.LayerNorm(self.embed_dim)
 
-
-        # NOTE: from relation-detr
-        self.query_scale = MLP(self.embed_dim, self.embed_dim, self.embed_dim, 2)
-        # relation embedding
-        self.position_relation_embedding = PositionRelationEmbedding(16, self.num_heads)
-
-
+        # decoder-v1.1
         # # Adjust the input dimension of refine_points
         # self.refine_points = nn.Sequential(
         #     nn.Linear(self.embed_dim + 4 + self.num_votes * 2 * self.num_levels, self.embed_dim),
@@ -770,6 +764,14 @@ class HoughTransformerDecoder(nn.Module):
         #     nn.Tanh()  # 使用 Tanh 将输出限制在 [-1, 1] 范围内
         # )
         # self.refine_scale = nn.Parameter(torch.tensor(0.1))  # 可学习的缩放因子
+
+        # NOTE: from relation-detr decoder-v1.2, v1.3
+        self.query_scale = MLP(self.embed_dim, self.embed_dim, self.embed_dim, 2)
+        # relation embedding
+        # self.position_relation_embedding = PositionRelationEmbedding(16, self.num_heads)
+        # hough embedding
+        self.position_relation_embedding = MultiHeadCrossLayerHoughNetSpatialRelation(
+            self.embed_dim, self.num_heads, self.num_votes)
 
         self.init_weights()
 
@@ -788,7 +790,7 @@ class HoughTransformerDecoder(nn.Module):
             nn.init.constant_(bbox_head.layers[-1].weight, 0.0)
             nn.init.constant_(bbox_head.layers[-1].bias, 0.0)
 
-
+        # decoder-v1.1
         # # 初始化第一层
         # nn.init.xavier_uniform_(self.refine_points[0].weight, gain=1/math.sqrt(2))
         # nn.init.constant_(self.refine_points[0].bias, 0)
@@ -823,6 +825,11 @@ class HoughTransformerDecoder(nn.Module):
         # (batch_size, 1, num_levels, 4)
         valid_ratio_scale = torch.cat([valid_ratios, valid_ratios], -1)[:, None]
 
+        # decoder-v1.2, v1.3
+        # NOTE: attn_mask is used in attention mechanisms to control which positions should be attended 
+        # to and which should be ignored
+        pos_relation = attn_mask  # fallback pos_relation to attn_mask
+
         for layer_idx, layer in enumerate(self.layers):
             # reference_points: (batch_size, num_queries, 4)
             # 乘法的效果：
@@ -834,7 +841,7 @@ class HoughTransformerDecoder(nn.Module):
             query_sine_embed = get_sine_pos_embed(reference_points_input[:, :, 0, :])
             query_pos = self.ref_point_head(query_sine_embed)
 
-
+            # decoder-v1.2, v1.3
             # NOTE: relation-detr
             query_pos = query_pos * self.query_scale(query) if layer_idx != 0 else query_pos
 
@@ -848,43 +855,27 @@ class HoughTransformerDecoder(nn.Module):
                 level_start_index=level_start_index,
                 value_pos=value_pos,
                 key_padding_mask=key_padding_mask,
-                self_attn_mask=attn_mask,
+                self_attn_mask=pos_relation,
                 memory_mask=memory_mask,
             )
 
-            # get output, reference_points are not detached for look_forward_twice
+           # get output, reference_points are not detached for look_forward_twice, no detach
             output_class = self.class_head[layer_idx](self.norm(query))
             output_coord = self.bbox_head[layer_idx](self.norm(query)) + inverse_sigmoid(reference_points)
             output_coord = output_coord.sigmoid()
             outputs_classes.append(output_class)
+            # 代表了当前层对边界框位置的最新预测。它被用来计算损失，并作为模型的最终输出
+            # 是每层的最终输出，用于损失计算和最终预测
             outputs_coords.append(output_coord)
 
             if layer_idx == self.num_layers - 1:
                 break
-            
-            if not skip_relation:
-                # src_boxes：对于第一层（layer_idx == 0），它使用初始的 reference_points。
-                # 对于后续层，它使用上一层的 tgt_boxes。
-                # tgt_boxes：总是使用当前层的 output_coord。
-                # 迭代细化过程 - 在每一层，模型都在尝试改进之前的预测
-                # src_boxes 代表上一次的预测（或初始猜测）。
-                # tgt_boxes 代表当前层的新预测
-                src_boxes = tgt_boxes if layer_idx >= 1 else reference_points
-                tgt_boxes = output_coord
-                pos_relation = self.position_relation_embedding(src_boxes, tgt_boxes).flatten(0, 1)
-                if attn_mask is not None:
-                    # 对于 attn_mask 中为 True 的位置，将 pos_relation 中对应位置的值设为
-                    # float("-inf"),在后续的 softmax 操作中，这些位置会得到接近零的权重。
-                    # 实际上这相当于完全忽略了这些位置关系
-                    # 在注意力计算中，被掩码的位置关系将不会被考虑,模型只会关注未被掩码的位置关系
-                    pos_relation.masked_fill_(attn_mask, float("-inf"))        
 
-
+            # decoder-v1.1
             # # Note: refinement HoughNet integration
             # if vote_fields is not None:
             #     # Refine reference points using vote_fields
             #     vote_info = self.sample_votes(vote_fields, reference_points)
-
             #     # vote_info: [batch_size, num_queries, num_votes * vote_dim]
             #     # query: (batch_size, num_queries, embed_dim)
             #     refine_input = torch.cat([query, reference_points, vote_info], dim=-1)
@@ -892,10 +883,43 @@ class HoughTransformerDecoder(nn.Module):
             #     refined_deltas = self.refine_points(refine_input) * self.refine_scale
             #     reference_points = reference_points + refined_deltas
             #     reference_points = reference_points.sigmoid()  # Ensure values are in [0, 1]
+            
+
+            # decoder-v1.2-relation
+            # if not skip_relation:
+            #     # src_boxes：对于第一层（layer_idx == 0），它使用初始的 reference_points。
+            #     # 对于后续层，它使用上一层的 tgt_boxes。
+            #     # tgt_boxes：总是使用当前层的 output_coord。
+            #     # 迭代细化过程 - 在每一层，模型都在尝试改进之前的预测
+            #     # src_boxes 代表上一次的预测（或初始猜测）。
+            #     # tgt_boxes 代表当前层的新预测
+            #     src_boxes = tgt_boxes if layer_idx >= 1 else reference_points
+            #     tgt_boxes = output_coord
+            #     # (batch_size * num_heads, num_queries, num_queries)
+            #     pos_relation = self.position_relation_embedding(src_boxes, tgt_boxes).flatten(0, 1)
+            #     if attn_mask is not None:
+            #         # 对于 attn_mask 中为 True 的位置，将 pos_relation 中对应位置的值设为
+            #         # float("-inf"),在后续的 softmax 操作中，这些位置会得到接近零的权重。
+            #         # 实际上这相当于完全忽略了这些位置关系
+            #         # 在注意力计算中，被掩码的位置关系将不会被考虑,模型只会关注未被掩码的位置关系
+            #         # 掩码允许更细粒度的控制，可以实现"软"掩码
+            #         pos_relation.masked_fill_(attn_mask, float("-inf"))        
 
 
-            # iterative bounding box refinement
+            # decoder-v1.3-hough-relation
+            #  queries, current_ref_points, prev_ref_points
+            if not skip_relation:
+                src_boxes = tgt_boxes if layer_idx >= 1 else reference_points
+                tgt_boxes = output_coord
+                pos_relation = self.position_relation_embedding(query, tgt_boxes, src_boxes).flatten(0, 1)
+                if attn_mask is not None:
+                    pos_relation.masked_fill_(attn_mask, float("-inf")) 
+
+
+            # iterative bounding box refinement, with detach
             # 通过多层迭代，reference_points 逐步细化，每一层都基于前一层的结果进行调整
+            # 在每一层的开始，它们代表了上一层的预测或初始猜测
+            # 在每一层的结束，它们被更新为下一层的初始参考点
             reference_points = self.bbox_head[layer_idx](query) + inverse_sigmoid(reference_points.detach())
             reference_points = reference_points.sigmoid()
 
@@ -905,7 +929,7 @@ class HoughTransformerDecoder(nn.Module):
 
 
 # ----------------------------------------------------------------
-# START CA: multi-scale mask for att
+# START v1.0 CA: multi-scale mask for att
 # # gen_memory_mask 函数的主要作用是为多尺度特征图生成内存掩码(memory mask)
 # # memory: encoder outut
 # # 用于在注意力机制中限制每个查询只关注其相关的区域 for cross-attention
@@ -958,9 +982,8 @@ class HoughTransformerDecoder(nn.Module):
 # ----------------------------------------------------------------
 
 
-
 # -------------------------------------------------------------
-# STATRT sample votes as refinement
+# STATRT v1.1 sample votes as refinement
 # class MultiScaleHoughNetVoting(nn.Module):
 #     def __init__(
 #             self,
@@ -1017,9 +1040,307 @@ class HoughTransformerDecoder(nn.Module):
 
 
 # -------------------------------------------------------------
-# START relation
-# src_boxes: [batch_size, num_boxes1, 4]
-# tgt_boxes: [batch_size, num_boxes2, 4]
+# # START v1.2 relation
+# # src_boxes: [batch_size, num_boxes1, 4]
+# # tgt_boxes: [batch_size, num_boxes2, 4]
+# def box_rel_encoding(src_boxes, tgt_boxes, eps=1e-5):
+#     # construct position relation
+#     # xy1: [batch_size, num_boxes1, 2]
+#     # wh1: [batch_size, num_boxes1, 2]
+#     xy1, wh1 = src_boxes.split([2, 2], -1)
+#     xy2, wh2 = tgt_boxes.split([2, 2], -1)
+#     # delta_xy: [batch_size, num_boxes1, num_boxes2, 2]
+#     delta_xy = torch.abs(xy1.unsqueeze(-2) - xy2.unsqueeze(-3))
+#     # delta_xy: [batch_size, num_boxes1, num_boxes2, 2]
+#     delta_xy = torch.log(delta_xy / (wh1.unsqueeze(-2) + eps) + 1.0)
+#     # delta_wh: [batch_size, num_boxes1, num_boxes2, 2]
+#     delta_wh = torch.log((wh1.unsqueeze(-2) + eps) / (wh2.unsqueeze(-3) + eps))
+#     # pos_embed: [batch_size, num_boxes1, num_boxes2, 4]
+#     pos_embed = torch.cat([delta_xy, delta_wh], -1)  # [batch_size, num_boxes1, num_boxes2, 4]
+
+#     return pos_embed
+
+
+# # This class generates embeddings that represent the relative positions and relationships
+# # between bounding boxes. These embeddings can be used in attention mechanisms to help
+# # the model understand spatial relationships between objects.
+# class PositionRelationEmbedding(nn.Module):
+#     def __init__(
+#         self,
+#         embed_dim=256,
+#         num_heads=8,
+#         temperature=10000.,
+#         scale=100.,
+#         activation_layer=nn.ReLU,
+#         inplace=True,
+#     ):
+#         super().__init__()
+#         # This is a 1x1 convolution that projects the position encoding to
+#         # the number of attention heads
+#         self.pos_proj = Conv2dNormActivation(
+#             embed_dim * 4,
+#             num_heads,
+#             kernel_size=1,
+#             inplace=inplace,
+#             norm_layer=None,
+#             activation_layer=activation_layer,
+#         )
+#         # This creates a partial function for generating sinusoidal position embeddings
+#         self.pos_func = functools.partial(
+#             get_sine_pos_embed,
+#             num_pos_feats=embed_dim,
+#             temperature=temperature,
+#             scale=scale,
+#             exchange_xy=False,
+#         )
+
+#     def forward(self, src_boxes: Tensor, tgt_boxes: Tensor = None):
+#         if tgt_boxes is None:
+#             tgt_boxes = src_boxes
+#         # src_boxes: [batch_size, num_boxes1, 4]
+#         # tgt_boxes: [batch_size, num_boxes2, 4]
+#         torch._assert(src_boxes.shape[-1] == 4, f"src_boxes much have 4 coordinates")
+#         torch._assert(tgt_boxes.shape[-1] == 4, f"tgt_boxes must have 4 coordinates")
+#         with torch.no_grad():
+#             # pos_embed: [batch_size, num_boxes1, num_boxes2, 4]
+#             # 这 4 个维度中的每一个，都会生成 num_pos_feats 个特征
+#             pos_embed = box_rel_encoding(src_boxes, tgt_boxes)
+#             # pos_embed: [batch_size, 4 * embed_dim, num_boxes1, num_boxes2]
+#             pos_embed = self.pos_func(pos_embed).permute(0, 3, 1, 2)
+#         # pos_embed: [batch_size, num_heads, num_boxes1, num_boxes2]
+#         pos_embed = self.pos_proj(pos_embed)
+
+#         return pos_embed.clone()
+# # END relation
+# -------------------------------------------------------------
+
+
+# -------------------------------------------------------------
+# START v1.3 Hough
+class MultiHeadCrossLayerHoughNetSpatialRelation(nn.Module):
+    def __init__(
+            self, 
+            embed_dim, 
+            num_heads, 
+            num_votes,
+            embed_pos_dim=16,
+            hidden_dim=32,#256,
+            temperature=10000.,
+            scale=100.,
+            activation_layer=nn.ReLU,
+            inplace=True):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.num_votes = num_votes
+        self.hidden_dim = hidden_dim
+        
+        self.vote_generator = MLP(self.embed_dim, self.hidden_dim, self.num_votes * 2, 1)
+
+        self.pos_proj = Conv2dNormActivation(
+            embed_pos_dim * 5, # (center_x, center_y, w, h, score)
+            num_heads,
+            kernel_size=1,
+            inplace=inplace,
+            norm_layer=None,
+            activation_layer=activation_layer,
+        )
+        # This creates a partial function for generating sinusoidal position embeddings
+        self.pos_func = functools.partial(
+            get_sine_pos_embed,
+            num_pos_feats=embed_pos_dim, # embed_dim
+            temperature=temperature,
+            scale=scale,
+            exchange_xy=False,
+        )
+        
+        # # 投票聚合器
+        # self.vote_aggregator = nn.Sequential(
+        #     nn.Conv2d(num_votes, hidden_dim, kernel_size=3, padding=1),
+        #     nn.ReLU(),
+        #     nn.Conv2d(hidden_dim, num_heads, kernel_size=1)
+        # )
+        
+        # # 关系编码器 (现在为每个头生成单独的关系)
+        # self.relation_encoder = nn.Sequential(
+        #     nn.Linear(9*num_heads, hidden_dim),  # 9 * num_heads = 1 (aggregated vote) + 4 (current box) + 4 (previous box)
+        #     nn.ReLU(),
+        #     nn.Linear(hidden_dim, num_heads)
+        # )
+
+    def forward(self, queries, current_ref_points, prev_ref_points):
+        """
+        Args:
+        - queries: Tensor of shape [batch_size, num_queries, embed_dim]
+        - current_ref_points: Tensor of shape [batch_size, num_queries, 4]
+        - prev_ref_points: Tensor of shape [batch_size, num_queries, 4]
+        
+        Returns:
+        - attention_mask: Tensor of shape [batch_size, num_heads, num_queries, num_queries]
+        """
+        batch_size, num_queries, _ = queries.shape
+        
+        # 生成投票
+        # votes = self.vote_generator(queries).view(batch_size, num_queries, self.num_votes, 2)
+        # current_ref = current_ref_points[:, :, :2].unsqueeze(2)  # (batch_size, num_queries, 1, 2)
+        # vote_positions = current_ref + votes  # (batch_size, num_queries, num_votes, 2)
+        vote_positions = current_ref_points[:, :, :2].unsqueeze(2) + \
+            self.vote_generator(queries).view(batch_size, num_queries, self.num_votes, 2)
+
+        # influence_map: [batch_size, num_queries, num_queries]
+        influence_map = self.create_influence_map(vote_positions, current_ref_points)
+        # del vote_positions
+
+        with torch.no_grad():
+            # pos_embed: [batch_size, num_boxes1, num_boxes2, 4]
+            pos_embed = box_rel_encoding(prev_ref_points, current_ref_points)
+        
+        # 将 influence_map 扩展一个维度以匹配 pos_embed 的形状
+        # influence_map_expanded = influence_map.unsqueeze(-1)  # [batch_size, num_queries, num_queries, 1]
+        # 拼接 influence_map 和 pos_embed
+        # fused_embed = torch.cat([influence_map.unsqueeze(-1), pos_embed], dim=-1)  # [batch_size, num_queries, num_queries, 5]
+        
+        # # 如果需要，可以通过一个线性层来融合这些特征
+        # fusion_layer = nn.Linear(5, output_dim)  # 创建一个线性层来融合特征
+        # fused_embed = fusion_layer(fused_embed)  # [batch_size, num_queries, num_queries, output_dim]
+        # 如果需要用于注意力机制，可能还需要重塑维度
+        # fused_embed = fused_embed.permute(0, 3, 1, 2)  # [batch_size, output_dim, num_queries, num_queries]
+        
+        # fused_embed: [batch_size, 5 * embed_dim, num_boxes1, num_boxes2]
+        # fused_embed = self.pos_func(fused_embed).permute(0, 3, 1, 2)
+        # fused_embed: [batch_size, num_heads, num_boxes1, num_boxes2]
+        # fused_embed = self.pos_proj(fused_embed)
+
+        # 直接计算 fused_embed，不存储中间结果
+        fused_embed = self.pos_proj(
+            self.pos_func(torch.cat(
+                [influence_map.unsqueeze(-1), pos_embed], dim=-1)).permute(0, 3, 1, 2))
+        # del influence_map, pos_embed
+
+        return fused_embed.clone()
+
+
+    def create_influence_map(self, vote_positions, reference_points):
+        """
+        创建影响图
+        
+        Args:
+        - vote_positions: [batch_size, num_queries, num_votes, 2]
+        - reference_points: [batch_size, num_queries, 4] (x_center, y_center, width, height)
+        
+        Returns:
+        - influence_map: [batch_size, num_queries, num_queries]
+        """
+        batch_size, num_queries, num_votes, _ = vote_positions.shape
+        
+        # 提取参考点的中心坐标
+        reference_centers = reference_points[:, :, :2]  # [batch_size, num_queries, 2]
+        
+        # 将投票位置和参考中心点展平
+        vote_positions_flat = vote_positions.view(batch_size, num_queries * num_votes, 2)
+        reference_centers_flat = reference_centers.unsqueeze(2).expand(-1, -1, num_votes, -1).reshape(batch_size, num_queries * num_votes, 2)
+        
+        # 计算每个投票到每个参考中心点的距离
+        distances = torch.cdist(vote_positions_flat, reference_centers, p=2)  # [batch_size, num_queries * num_votes, num_queries]
+        
+        # 使用参考点的宽度和高度来调整 sigma
+        reference_sizes = reference_points[:, :, 2:]  # [batch_size, num_queries, 2] (width, height)
+        sigma = reference_sizes.mean(dim=-1, keepdim=True) / 2  # [batch_size, num_queries, 1]
+        sigma = sigma.repeat(1, num_votes, 1).view(batch_size, num_queries * num_votes, 1)  # [batch_size, num_queries * num_votes, 1]
+        # 使用自适应高斯核将距离转换为影响分数
+        influence_scores = torch.exp(-distances**2 / (2 * sigma**2))
+        
+        # 重塑并求和得到最终的影响图
+        influence_map = influence_scores.view(batch_size, num_queries, num_votes, num_queries).sum(dim=2)
+        
+        # 归一化影响图
+        influence_map = F.normalize(influence_map, p=1, dim=2)
+        # [batch_size, num_queries, num_queries]
+        return influence_map
+
+
+        # # 1. 准备投票位置
+        # current_ref = current_ref_points[:, :, :2].unsqueeze(2)  # (batch_size, num_queries, 1, 2)
+        # vote_positions = current_ref + votes  # (batch_size, num_queries, num_votes, 2)
+        # vote_positions = 2 * vote_positions - 1  # 归一化到 [-1, 1] 范围
+
+        # # 2. 创建投票热图
+        # vote_heatmap = self.create_vote_heatmap(
+        #     vote_positions.view(batch_size * num_queries, self.num_votes, 2), 
+        #     (num_queries, num_queries))
+        # vote_heatmap = vote_heatmap.view(
+        #     batch_size, num_queries, self.num_votes, num_queries, num_queries)
+
+        # # 3. 聚合投票
+        # aggregated_votes = self.vote_aggregator(vote_heatmap.permute(0, 1, 3, 4, 2))  # [batch_size, num_queries, num_queries, num_queries, num_heads]
+
+        # # 初始化投票图 (现在为每个头都生成一个投票图)
+        # vote_map = torch.zeros(batch_size, self.num_heads, num_queries, num_queries, device=queries.device)
+        
+        # for i in range(num_queries):
+        #     current_votes = votes[:, i].unsqueeze(1)
+        #     current_ref = current_ref_points[:, i, :2].unsqueeze(1)
+            
+        #     vote_positions = current_ref + current_votes
+        #     vote_positions = 2 * vote_positions - 1
+            
+        #     vote_heatmap = self.create_vote_heatmap(vote_positions, (num_queries, num_queries))
+        #     aggregated_votes = self.vote_aggregator(vote_heatmap)  # Shape: [batch_size, num_heads, num_queries, num_queries]
+            
+        #     vote_map[:, :, i] = aggregated_votes.squeeze(2)
+        
+        # # 计算当前层和前一层的参考点差异   
+        # current_diffs: (batch_size, num_queries, num_queries, 4)
+        # current_diffs = self.compute_reference_diffs(current_ref_points)
+        # prev_diffs = self.compute_reference_diffs(prev_ref_points)
+        
+        # # 编码空间关系，考虑当前层和前一层的信息 (为每个头单独编码)
+        # # relation_input: (batch_size, num_queries, num_queries, 9num_heads)
+        # relation_input = torch.cat([
+        #     vote_map.permute(0, 2, 3, 1),  # [batch_size, num_queries, num_queries, num_heads]
+        #     current_diffs.unsqueeze(-1).expand(-1, -1, -1, -1, self.num_heads).reshape(batch_size, num_queries, num_queries, -1),
+        #     prev_diffs.unsqueeze(-1).expand(-1, -1, -1, -1, self.num_heads).reshape(batch_size, num_queries, num_queries, -1),
+        # ], dim=-1)
+        # # relations: (batch_size, num_heads, num_queries, num_queries)
+        # relations = self.relation_encoder(relation_input).permute(0, 3, 1, 2)
+
+        # # Apply softmax to get attention weights
+        # attention_weights = F.softmax(relations, dim=-1)
+    
+        # # Convert attention weights to additive attention mask
+        # attention_mask = -10000.0 * (1.0 - attention_weights)
+
+
+    # def create_vote_heatmap(self, vote_positions, size):
+    #     batch_size, _, num_votes, _ = vote_positions.shape
+    #     height, width = size
+    #     grid = vote_positions.view(batch_size * num_votes, 1, 1, 2)
+    #     heatmap = F.grid_sample(
+    #         torch.ones(batch_size * num_votes, 1, 1, 1, device=vote_positions.device),
+    #         grid,
+    #         mode='bilinear',
+    #         align_corners=True
+    #     )
+    #     heatmap = F.interpolate(heatmap, size=(height, width), mode='bilinear', align_corners=True)
+    #     return heatmap.view(batch_size, num_votes, height, width)
+
+    # def create_vote_heatmap(self, vote_positions, size):
+    #     batch_size, _, num_votes, _ = vote_positions.shape
+    #     grid = vote_positions.view(batch_size, -1, 1, 2)
+    #     heatmap = F.grid_sample(
+    #         torch.ones(batch_size, num_votes, 1, 1, device=vote_positions.device),
+    #         grid,
+    #         mode='bilinear',
+    #         align_corners=True
+    #     )
+    #     return heatmap.view(batch_size, num_votes, *size)
+
+    # def compute_reference_diffs(self, reference_points):
+    #     batch_size, num_queries, _ = reference_points.shape
+    #     ref_points_expanded = reference_points.unsqueeze(2).expand(-1, -1, num_queries, -1)
+    #     diffs = ref_points_expanded - reference_points.unsqueeze(1)
+    #     return diffs
+
 def box_rel_encoding(src_boxes, tgt_boxes, eps=1e-5):
     # construct position relation
     # xy1: [batch_size, num_boxes1, 2]
@@ -1037,55 +1358,20 @@ def box_rel_encoding(src_boxes, tgt_boxes, eps=1e-5):
 
     return pos_embed
 
+# # 使用示例
+# if __name__ == "__main__":
+#     batch_size = 2
+#     num_queries = 100
+#     embed_dim = 256
+#     num_heads = 8
+#     num_votes = 9
 
-# This class generates embeddings that represent the relative positions and relationships
-# between bounding boxes. These embeddings can be used in attention mechanisms to help
-# the model understand spatial relationships between objects.
-class PositionRelationEmbedding(nn.Module):
-    def __init__(
-        self,
-        embed_dim=256,
-        num_heads=8,
-        temperature=10000.,
-        scale=100.,
-        activation_layer=nn.ReLU,
-        inplace=True,
-    ):
-        super().__init__()
-        # This is a 1x1 convolution that projects the position encoding to
-        # the number of attention heads
-        self.pos_proj = Conv2dNormActivation(
-            embed_dim * 4,
-            num_heads,
-            kernel_size=1,
-            inplace=inplace,
-            norm_layer=None,
-            activation_layer=activation_layer,
-        )
-        # This creates a partial function for generating sinusoidal position embeddings
-        self.pos_func = functools.partial(
-            get_sine_pos_embed,
-            num_pos_feats=embed_dim,
-            temperature=temperature,
-            scale=scale,
-            exchange_xy=False,
-        )
+#     model = MultiHeadCrossLayerHoughNetSpatialRelation(embed_dim, num_heads, num_votes)
+#     queries = torch.randn(batch_size, num_queries, embed_dim)
+#     current_ref_points = torch.rand(batch_size, num_queries, 4)
+#     prev_ref_points = torch.rand(batch_size, num_queries, 4)
 
-    def forward(self, src_boxes: Tensor, tgt_boxes: Tensor = None):
-        if tgt_boxes is None:
-            tgt_boxes = src_boxes
-        # src_boxes: [batch_size, num_boxes1, 4]
-        # tgt_boxes: [batch_size, num_boxes2, 4]
-        torch._assert(src_boxes.shape[-1] == 4, f"src_boxes much have 4 coordinates")
-        torch._assert(tgt_boxes.shape[-1] == 4, f"tgt_boxes must have 4 coordinates")
-        with torch.no_grad():
-            # pos_embed: [batch_size, num_boxes1, num_boxes2, 4]
-            pos_embed = box_rel_encoding(src_boxes, tgt_boxes)
-            # pos_embed: [batch_size, 4 * embed_dim, num_boxes1, num_boxes2]
-            pos_embed = self.pos_func(pos_embed).permute(0, 3, 1, 2)
-        # pos_embed: [batch_size, num_heads, num_boxes1, num_boxes2]
-        pos_embed = self.pos_proj(pos_embed)
-
-        return pos_embed.clone()
-# END relation
-# -------------------------------------------------------------
+#     attention_mask = model(queries, current_ref_points, prev_ref_points)
+#     print("Attention mask shape:", attention_mask.shape)
+# # END Hough
+# # -------------------------------------------------------------
