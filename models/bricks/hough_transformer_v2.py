@@ -1135,7 +1135,11 @@ class MultiHeadCrossLayerHoughNetSpatialRelation(nn.Module):
         self.num_votes = num_votes
         self.hidden_dim = hidden_dim
         
-        self.vote_generator = MLP(self.embed_dim, self.hidden_dim, self.num_votes * 2, 1)
+        self.vote_generator = MLP(
+            self.embed_dim, 
+            self.hidden_dim, 
+            self.num_votes * 2, 
+            1)
 
         self.pos_proj = Conv2dNormActivation(
             embed_pos_dim * 5, # (center_x, center_y, w, h, score)
@@ -1255,6 +1259,10 @@ class MultiHeadCrossLayerHoughNetSpatialRelation(nn.Module):
         
         # 归一化影响图
         influence_map = F.normalize(influence_map, p=1, dim=2)
+
+        # can improve from 41.0 to 41.8
+        influence_map = 1.0 - influence_map
+        # influence_map = -10000.0 * (1.0 - influence_map)
         # [batch_size, num_queries, num_queries]
         return influence_map
 
