@@ -1142,7 +1142,7 @@ class MultiHeadCrossLayerHoughNetSpatialRelation(nn.Module):
             1)
 
         self.pos_proj = Conv2dNormActivation(
-            embed_pos_dim * 5, # (center_x, center_y, w, h, score)
+            embed_pos_dim * 1, # (center_x, center_y, w, h, score) -> (score)
             num_heads,
             kernel_size=1,
             inplace=inplace,
@@ -1195,9 +1195,11 @@ class MultiHeadCrossLayerHoughNetSpatialRelation(nn.Module):
         influence_map = self.create_influence_map(vote_positions, current_ref_points)
         # del vote_positions
 
-        with torch.no_grad():
-            # pos_embed: [batch_size, num_boxes1, num_boxes2, 4]
-            pos_embed = box_rel_encoding(prev_ref_points, current_ref_points)
+        # temporarily disable
+        # with torch.no_grad():
+        #     # pos_embed: [batch_size, num_boxes1, num_boxes2, 4]
+        #     pos_embed = box_rel_encoding(prev_ref_points, current_ref_points)
+
         
         # 将 influence_map 扩展一个维度以匹配 pos_embed 的形状
         # influence_map_expanded = influence_map.unsqueeze(-1)  # [batch_size, num_queries, num_queries, 1]
@@ -1215,10 +1217,15 @@ class MultiHeadCrossLayerHoughNetSpatialRelation(nn.Module):
         # fused_embed: [batch_size, num_heads, num_boxes1, num_boxes2]
         # fused_embed = self.pos_proj(fused_embed)
 
-        # 直接计算 fused_embed，不存储中间结果
+        # # 直接计算 fused_embed，不存储中间结果
+        # fused_embed = self.pos_proj(
+        #     self.pos_func(torch.cat(
+        #         [influence_map.unsqueeze(-1), pos_embed], dim=-1)).permute(0, 3, 1, 2))
+
+
         fused_embed = self.pos_proj(
             self.pos_func(torch.cat(
-                [influence_map.unsqueeze(-1), pos_embed], dim=-1)).permute(0, 3, 1, 2))
+                [influence_map.unsqueeze(-1)], dim=-1)).permute(0, 3, 1, 2))
         # del influence_map, pos_embed
 
         return fused_embed.clone()

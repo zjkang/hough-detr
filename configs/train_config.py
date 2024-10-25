@@ -6,7 +6,7 @@ from optimizer import param_dict
 
 # Commonly changed training configurations
 num_epochs = 12   # train epochs
-batch_size = 1    # total_batch_size = #GPU x batch_size
+batch_size = 2    # total_batch_size = #GPU x batch_size
 num_workers = 4   # workers for pytorch DataLoader
 pin_memory = True # whether pin_memory for pytorch DataLoader
 print_freq = 50   # frequency to print logs
@@ -18,7 +18,7 @@ find_unused_parameters = False  # useful for debugging distributed training
 
 # define dataset for train
 # coco_path = "../autodl-tmp/data/COCO2017-debug"  # /PATH/TO/YOUR/COCODIR
-coco_path = "../autodl-tmp/data/COCO2017-small"  # /PATH/TO/YOUR/COCODIR
+coco_path = "../autodl-tmp/data/COCO2017"  # /PATH/TO/YOUR/COCODIR "../autodl-tmp/data/COCO2017-small"
 
 train_transform = presets.detr  # see transforms/presets to choose a transform
 train_dataset = CocoDetection(
