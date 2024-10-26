@@ -972,10 +972,18 @@ class HoughTransformerDecoder(nn.Module):
         outputs_coords = []
         valid_ratio_scale = torch.cat([valid_ratios, valid_ratios], -1)[:, None]
 
+        # decoder-v1.2, v1.3
+        # NOTE: attn_mask is used in attention mechanisms to control which positions should be attended
+        # to and which should be ignored
+        pos_relation = attn_mask  # fallback pos_relation to attn_mask
+
         for layer_idx, layer in enumerate(self.layers):
             reference_points_input = reference_points.detach()[:, :, None] * valid_ratio_scale
             query_sine_embed = get_sine_pos_embed(reference_points_input[:, :, 0, :])
             query_pos = self.ref_point_head(query_sine_embed)
+
+            # NOTE: relation-detr
+            query_pos = query_pos * self.query_scale(query) if layer_idx != 0 else query_pos
 
             # relation embedding
             query = layer(
@@ -986,7 +994,7 @@ class HoughTransformerDecoder(nn.Module):
                 spatial_shapes=spatial_shapes,
                 level_start_index=level_start_index,
                 key_padding_mask=key_padding_mask,
-                self_attn_mask=attn_mask,
+                self_attn_mask=pos_relation,
             )
 
             # get output, reference_points are not detached for look_forward_twice
