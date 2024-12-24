@@ -59,6 +59,8 @@ echo "DONE."
 
 2. install miniconda miniconda3
 
+conda create --name detr python=3.8
+
 
 How to debug locally
 1. SSH remote host
