@@ -74,15 +74,11 @@ jupyter notebook --no-browser
 How to run
 CUDA_VISIBLE_DEVICES=0 accelerate launch main.py
 
-How to evaluate
+How to evaluate (e.g.)
 CUDA_VISIBLE_DEVICES=0 accelerate launch test.py \
   --coco-path ../autodl-tmp/data/COCO2017 \
   --model-config configs/dino_pp/dino_pp_resnet50_800_1333.py \
   --checkpoint checkpoints/dino_pp_resnet50_800_1333/train/decoder-query-optm-v2.1-stable-many-matching_2025-01-10-13_38_45/best_ap.pth
-
-  --checkpoint https://github.com/xiuqhou/Relation-DETR/releases/download/v1.0.0/relation_detr_resnet50_800_1333_coco_1x.pth
-
-
 
 ----
 conda env
